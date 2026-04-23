@@ -60,8 +60,9 @@ The output folder includes:
 
 - `collected/episodes.jsonl.gz`
 - `metrics.csv`
-- `checkpoints/best.pt`
-- `checkpoints/last.pt`
+- `checkpoints/best.pth`
+- `checkpoints/last.pth`
+- `checkpoints/interrupt.pth` when training is stopped manually
 - `summary.json`
 
 ## References

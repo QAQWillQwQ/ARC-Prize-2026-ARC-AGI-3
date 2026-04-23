@@ -132,6 +132,7 @@ def save_checkpoint(
     config: Dict[str, Any],
     epoch: int,
     best_score: float,
+    extra_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
         "model_state": model.state_dict(),
@@ -140,9 +141,10 @@ def save_checkpoint(
         "epoch": epoch,
         "best_score": best_score,
     }
+    if extra_state:
+        payload.update(extra_state)
     torch.save(payload, path)
 
 
 def load_checkpoint(path: str, device: torch.device) -> Dict[str, Any]:
     return torch.load(path, map_location=device)
-

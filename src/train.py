@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -31,7 +32,7 @@ from .common import (
     split_games,
     transition_reward,
 )
-from .model import build_model, save_checkpoint
+from .model import build_model, load_checkpoint, save_checkpoint
 
 
 class EpisodeTransitionDataset(Dataset):
@@ -56,6 +57,8 @@ class EpisodeTransitionDataset(Dataset):
                 history_frames = pad_history(frames_so_far + [frame], history=self.history)
                 next_history_frames = pad_history(frames_so_far + [frame, next_frame], history=self.history)
                 progress = int(transition["levels_after"]) - int(transition["levels_before"])
+                next_transition = transitions[idx + 1] if idx + 1 < len(transitions) else transition
+                next_steps_since_progress = 0 if progress > 0 else steps_since_progress + 1
                 sample = {
                     "obs": one_hot_frames(history_frames),
                     "next_obs": one_hot_frames(next_history_frames),
@@ -66,6 +69,15 @@ class EpisodeTransitionDataset(Dataset):
                         steps_since_progress=steps_since_progress,
                         step_index=idx,
                         frame=history_frames[-1],
+                        max_steps=self.max_steps,
+                    ),
+                    "next_scalar": scalar_features(
+                        available_actions=next_transition["available_actions"],
+                        last_action_id=int(transition["action_id"]),
+                        levels_completed=int(transition["levels_after"]),
+                        steps_since_progress=next_steps_since_progress,
+                        step_index=idx + 1,
+                        frame=next_history_frames[-1],
                         max_steps=self.max_steps,
                     ),
                     "available_mask": torch.tensor(action_mask(transition["available_actions"]), dtype=torch.float32),
@@ -123,6 +135,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reset-limit", type=int, default=4)
     parser.add_argument("--online-val-every", type=int, default=None)
     parser.add_argument("--online-val-games", type=int, default=5)
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--checkpoint-every-steps", type=int, default=0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -144,6 +159,56 @@ def move_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
 
 def masked_average(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     return (values * weights).sum() / weights.sum().clamp_min(1e-6)
+
+
+def save_training_checkpoint(
+    checkpoints_dir: Path,
+    stem: str,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    config: Dict[str, Any],
+    epoch: int,
+    best_score: float,
+    extra_state: Optional[Dict[str, Any]] = None,
+) -> Path:
+    primary_path = checkpoints_dir / ("%s.pth" % stem)
+    legacy_path = checkpoints_dir / ("%s.pt" % stem)
+    save_checkpoint(
+        path=str(primary_path),
+        model=model,
+        optimizer=optimizer,
+        config=config,
+        epoch=epoch,
+        best_score=best_score,
+        extra_state=extra_state,
+    )
+    shutil.copyfile(primary_path, legacy_path)
+    return primary_path
+
+
+def restore_training_state(
+    resume_path: Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+) -> Dict[str, Any]:
+    payload = load_checkpoint(str(resume_path), device=device)
+    model.load_state_dict(payload["model_state"])
+    optimizer_state = payload.get("optimizer_state")
+    if optimizer_state is not None:
+        optimizer.load_state_dict(optimizer_state)
+    last_epoch = int(payload.get("epoch", 0))
+    epoch_complete = bool(payload.get("epoch_complete", True))
+    best_score = float(payload.get("best_score", float("-inf")))
+    best_epoch = int(payload.get("best_epoch", last_epoch if epoch_complete else max(last_epoch - 1, -1)))
+    start_epoch = last_epoch + 1 if epoch_complete else max(1, last_epoch)
+    return {
+        "start_epoch": start_epoch,
+        "best_metric": best_score,
+        "best_epoch": best_epoch,
+        "epoch_complete": epoch_complete,
+        "payload": payload,
+    }
 
 
 def evaluate_public_score(
@@ -187,6 +252,10 @@ def run_epoch(
     optimizer: Optional[torch.optim.Optimizer],
     device: torch.device,
     grad_accum: int,
+    max_grad_norm: float = 0.0,
+    epoch: int = 0,
+    checkpoint_every_steps: int = 0,
+    checkpoint_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -196,6 +265,7 @@ def run_epoch(
     total_action_count = 0.0
     total_coord_correct = 0.0
     total_coord_count = 0.0
+    optimizer_steps = 0
 
     autocast_enabled = device.type == "cuda"
     if optimizer is not None:
@@ -210,7 +280,7 @@ def run_epoch(
                 action_index=batch["action_index"],
             )
             with torch.no_grad():
-                next_latent = model.encode_state(batch["next_obs"], batch["scalar"])["pooled"]
+                next_latent = model.encode_state(batch["next_obs"], batch["next_scalar"])["pooled"]
 
             action_loss_per = F.cross_entropy(
                 out["action_logits"],
@@ -244,8 +314,22 @@ def run_epoch(
         if optimizer is not None:
             (loss / float(max(1, grad_accum))).backward()
             if (step + 1) % max(1, grad_accum) == 0 or (step + 1) == len(loader):
+                if max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_steps += 1
+                if checkpoint_callback is not None and checkpoint_every_steps > 0:
+                    if optimizer_steps % checkpoint_every_steps == 0:
+                        checkpoint_callback(
+                            {
+                                "epoch": epoch,
+                                "epoch_complete": False,
+                                "batch_in_epoch": step + 1,
+                                "optimizer_steps_in_epoch": optimizer_steps,
+                                "last_loss": float(loss.item()),
+                            }
+                        )
 
         total_loss += float(loss.item()) * batch["obs"].shape[0]
         action_pred = out["action_logits"].argmax(dim=-1)
@@ -287,6 +371,8 @@ def main() -> None:
         "depth": args.depth,
         "num_heads": args.num_heads,
         "online_val_every": args.online_val_every,
+        "checkpoint_every_steps": args.checkpoint_every_steps,
+        "max_grad_norm": args.max_grad_norm,
         "max_steps": args.max_steps,
         "stall_steps": args.stall_steps,
         "reset_limit": args.reset_limit,
@@ -313,11 +399,17 @@ def main() -> None:
         max_steps=int(config["max_steps"]),
     )
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
         num_workers=0,
+        pin_memory=device.type == "cuda",
         collate_fn=collate,
     )
     val_loader = DataLoader(
@@ -325,10 +417,10 @@ def main() -> None:
         batch_size=int(config["batch_size"]),
         shuffle=False,
         num_workers=0,
+        pin_memory=device.type == "cuda",
         collate_fn=collate,
     )
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = build_model(config).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -343,73 +435,175 @@ def main() -> None:
 
     best_metric = float("-inf")
     best_epoch = -1
-    for epoch in range(1, int(config["epochs"]) + 1):
-        train_metrics = run_epoch(
+    start_epoch = 1
+    if args.resume:
+        resume_path = Path(args.resume).resolve()
+        if not resume_path.exists():
+            raise FileNotFoundError("Resume checkpoint not found: %s" % resume_path)
+        resume_state = restore_training_state(
+            resume_path=resume_path,
             model=model,
-            loader=train_loader,
             optimizer=optimizer,
             device=device,
-            grad_accum=int(config["grad_accum"]),
         )
-        val_metrics = run_epoch(
-            model=model,
-            loader=val_loader,
-            optimizer=None,
-            device=device,
-            grad_accum=1,
+        start_epoch = int(resume_state["start_epoch"])
+        best_metric = float(resume_state["best_metric"])
+        best_epoch = int(resume_state["best_epoch"])
+        print(
+            "Resumed from %s at epoch %d (%s checkpoint)"
+            % (
+                resume_path,
+                start_epoch,
+                "complete" if resume_state["epoch_complete"] else "partial",
+            )
         )
 
-        last_checkpoint = checkpoints_dir / "last.pt"
-        save_checkpoint(
-            path=str(last_checkpoint),
+    current_epoch = 0
+
+    def checkpoint_callback(extra_state: Dict[str, Any]) -> None:
+        save_training_checkpoint(
+            checkpoints_dir=checkpoints_dir,
+            stem="last",
             model=model,
             optimizer=optimizer,
             config=config,
-            epoch=epoch,
+            epoch=int(extra_state.get("epoch", current_epoch)),
             best_score=best_metric if best_metric != float("-inf") else 0.0,
+            extra_state={
+                "best_epoch": best_epoch,
+                **extra_state,
+            },
         )
 
-        public_val_score = None
-        if val_games and epoch % int(config["online_val_every"]) == 0:
-            selected_games = list(val_games)[: max(1, int(args.online_val_games))]
-            public_val_score = evaluate_public_score(
-                checkpoint_path=str(last_checkpoint),
-                project_root=project_root,
-                metadata_map=metadata_map,
-                selected_games=selected_games,
-                max_steps=int(config["max_steps"]),
-                stall_steps=int(config["stall_steps"]),
-                reset_limit=int(config["reset_limit"]),
+    try:
+        for epoch in range(start_epoch, int(config["epochs"]) + 1):
+            current_epoch = epoch
+            train_metrics = run_epoch(
+                model=model,
+                loader=train_loader,
+                optimizer=optimizer,
+                device=device,
+                grad_accum=int(config["grad_accum"]),
+                max_grad_norm=float(config.get("max_grad_norm", 0.0)),
+                epoch=epoch,
+                checkpoint_every_steps=int(config.get("checkpoint_every_steps", 0)),
+                checkpoint_callback=checkpoint_callback,
+            )
+            val_metrics = run_epoch(
+                model=model,
+                loader=val_loader,
+                optimizer=None,
+                device=device,
+                grad_accum=1,
             )
 
-        row = {
-            "epoch": epoch,
-            "train_loss": round(train_metrics["loss"], 6),
-            "train_action_acc": round(train_metrics["action_acc"], 6),
-            "train_coord_acc": round(train_metrics["coord_acc"], 6),
-            "val_loss": round(val_metrics["loss"], 6),
-            "val_action_acc": round(val_metrics["action_acc"], 6),
-            "val_coord_acc": round(val_metrics["coord_acc"], 6),
-            "public_val_score": None if public_val_score is None else round(public_val_score, 6),
-        }
-        append_metrics_row(metrics_path, row)
-
-        selection_metric = public_val_score if public_val_score is not None else val_metrics["action_acc"]
-        if selection_metric > best_metric:
-            best_metric = float(selection_metric)
-            best_epoch = epoch
-            save_checkpoint(
-                path=str(checkpoints_dir / "best.pt"),
+            last_checkpoint = save_training_checkpoint(
+                checkpoints_dir=checkpoints_dir,
+                stem="last",
                 model=model,
                 optimizer=optimizer,
                 config=config,
                 epoch=epoch,
-                best_score=best_metric,
+                best_score=best_metric if best_metric != float("-inf") else 0.0,
+                extra_state={
+                    "epoch_complete": True,
+                    "best_epoch": best_epoch,
+                },
             )
 
+            public_val_score = None
+            if val_games and epoch % int(config["online_val_every"]) == 0:
+                selected_games = list(val_games)[: max(1, int(args.online_val_games))]
+                public_val_score = evaluate_public_score(
+                    checkpoint_path=str(last_checkpoint),
+                    project_root=project_root,
+                    metadata_map=metadata_map,
+                    selected_games=selected_games,
+                    max_steps=int(config["max_steps"]),
+                    stall_steps=int(config["stall_steps"]),
+                    reset_limit=int(config["reset_limit"]),
+                )
+
+            row = {
+                "epoch": epoch,
+                "train_loss": round(train_metrics["loss"], 6),
+                "train_action_acc": round(train_metrics["action_acc"], 6),
+                "train_coord_acc": round(train_metrics["coord_acc"], 6),
+                "val_loss": round(val_metrics["loss"], 6),
+                "val_action_acc": round(val_metrics["action_acc"], 6),
+                "val_coord_acc": round(val_metrics["coord_acc"], 6),
+                "public_val_score": None if public_val_score is None else round(public_val_score, 6),
+            }
+            append_metrics_row(metrics_path, row)
+
+            selection_metric = public_val_score if public_val_score is not None else val_metrics["action_acc"]
+            if selection_metric > best_metric:
+                best_metric = float(selection_metric)
+                best_epoch = epoch
+                save_training_checkpoint(
+                    checkpoints_dir=checkpoints_dir,
+                    stem="best",
+                    model=model,
+                    optimizer=optimizer,
+                    config=config,
+                    epoch=epoch,
+                    best_score=best_metric,
+                    extra_state={
+                        "epoch_complete": True,
+                        "best_epoch": best_epoch,
+                        "selection_metric": best_metric,
+                    },
+                )
+    except KeyboardInterrupt:
+        interrupt_checkpoint = save_training_checkpoint(
+            checkpoints_dir=checkpoints_dir,
+            stem="interrupt",
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            epoch=current_epoch,
+            best_score=best_metric if best_metric != float("-inf") else 0.0,
+            extra_state={
+                "epoch_complete": False,
+                "best_epoch": best_epoch,
+                "status": "interrupted",
+            },
+        )
+        save_training_checkpoint(
+            checkpoints_dir=checkpoints_dir,
+            stem="last",
+            model=model,
+            optimizer=optimizer,
+            config=config,
+            epoch=current_epoch,
+            best_score=best_metric if best_metric != float("-inf") else 0.0,
+            extra_state={
+                "epoch_complete": False,
+                "best_epoch": best_epoch,
+                "status": "interrupted",
+            },
+        )
+        summary = {
+            "status": "interrupted",
+            "best_epoch": best_epoch,
+            "best_metric": best_metric,
+            "resume_checkpoint": str(interrupt_checkpoint),
+            "train_games": train_games,
+            "val_games": val_games,
+            "num_train_episodes": len(train_episodes),
+            "num_val_episodes": len(val_episodes),
+            "num_train_samples": len(train_dataset),
+            "num_val_samples": len(val_dataset),
+        }
+        save_json(output_dir / "summary.json", summary)
+        print("Training interrupted. Checkpoint saved to %s" % interrupt_checkpoint)
+        return
+
     summary = {
+        "status": "finished",
         "best_epoch": best_epoch,
         "best_metric": best_metric,
+        "best_checkpoint": str(checkpoints_dir / "best.pth"),
         "train_games": train_games,
         "val_games": val_games,
         "num_train_episodes": len(train_episodes),
