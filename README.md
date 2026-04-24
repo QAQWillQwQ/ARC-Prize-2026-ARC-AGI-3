@@ -52,9 +52,13 @@ Fallback profile for `RTX 3070 Ti 8GB`:
 
 ## Training Output
 
+The Colab notebook copies project code from:
+
+`ARC Prize 2026 - ARC-AGI-3/`
+
 The Colab notebook writes outputs to:
 
-`ARC Prize 2026 - ARC-AGI-3/Training_Output/<timestamp>/`
+`ARC Prize 2026_AGI_3/Training_Output/<timestamp>/`
 
 The output folder includes:
 
