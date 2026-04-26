@@ -12,15 +12,15 @@ The latest OpenLab run produced a few better level 1 examples in `sp80`, `lp85`,
 
 **`sp80` level 1, then `GAME_OVER`**
 
-![sp80 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top02_sp80_lvl1_gameover_seed200013_try1/breadth_all_sp80_seed200013_try1_GAME_OVER_lvl1_score4p762_act63.gif)
+![sp80 level 1 case](docs/gifs/sp80_level1_gameover.gif)
 
 **`lp85` level 1, then `NOT_FINISHED`**
 
-![lp85 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top03_lp85_lvl1_not_finished_seed200011_try0/breadth_all_lp85_seed200011_try0_NOT_FINISHED_lvl1_score2p778_act112.gif)
+![lp85 level 1 case](docs/gifs/lp85_level1_not_finished.gif)
 
 **`ar25` level 1, then `NOT_FINISHED`**
 
-![ar25 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top04_ar25_lvl1_not_finished_seed200004_try1/breadth_all_ar25_seed200004_try1_NOT_FINISHED_lvl1_score2p778_act112.gif)
+![ar25 level 1 case](docs/gifs/ar25_level1_not_finished.gif)
 
 ## My Suggestion
 
