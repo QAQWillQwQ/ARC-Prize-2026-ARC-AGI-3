@@ -116,7 +116,12 @@ def collate(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the minimal ARC-AGI-3 object-centric policy.")
     parser.add_argument("--project-root", type=str, default=".")
-    parser.add_argument("--data", type=str, required=True, help="Path to collected episodes.jsonl.gz")
+    parser.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to one collected episodes.jsonl.gz file, or multiple comma separated paths.",
+    )
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--hardware-profile", type=str, default="a100")
     parser.add_argument("--seed", type=int, default=42)
@@ -141,8 +146,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def parse_data_paths(raw: str) -> List[Path]:
+    paths = [Path(part.strip()).resolve() for part in raw.split(",") if part.strip()]
+    if not paths:
+        raise RuntimeError("No valid --data paths were provided.")
+    return paths
+
+
 def load_episodes(path: Path) -> List[Dict[str, Any]]:
     return list(iter_jsonl_gz(path))
+
+
+def load_episodes_from_paths(paths: Sequence[Path]) -> List[Dict[str, Any]]:
+    episodes: List[Dict[str, Any]] = []
+    for path in paths:
+        if not path.exists():
+            raise FileNotFoundError("Collected data not found: %s" % path)
+        episodes.extend(load_episodes(path))
+    return episodes
 
 
 def split_episodes(episodes: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], List[str]]:
@@ -380,10 +401,11 @@ def main() -> None:
     config = merge_config(args.hardware_profile, overrides)
     config["hardware_profile"] = args.hardware_profile
     config["seed"] = args.seed
-    config["data"] = str(Path(args.data).resolve())
+    data_paths = parse_data_paths(args.data)
+    config["data"] = [str(path) for path in data_paths]
     save_json(output_dir / "train_config.json", config)
 
-    episodes = load_episodes(Path(args.data))
+    episodes = load_episodes_from_paths(data_paths)
     train_episodes, val_episodes, train_games, val_games = split_episodes(episodes)
     if not train_episodes:
         raise RuntimeError("No training episodes were found after the game-level split.")
@@ -588,6 +610,7 @@ def main() -> None:
             "best_epoch": best_epoch,
             "best_metric": best_metric,
             "resume_checkpoint": str(interrupt_checkpoint),
+            "data_paths": [str(path) for path in data_paths],
             "train_games": train_games,
             "val_games": val_games,
             "num_train_episodes": len(train_episodes),
@@ -604,6 +627,7 @@ def main() -> None:
         "best_epoch": best_epoch,
         "best_metric": best_metric,
         "best_checkpoint": str(checkpoints_dir / "best.pth"),
+        "data_paths": [str(path) for path in data_paths],
         "train_games": train_games,
         "val_games": val_games,
         "num_train_episodes": len(train_episodes),

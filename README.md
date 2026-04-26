@@ -1,5 +1,42 @@
 # ARC Prize 2026 ARC AGI 3
 
+## Yiding 04262026.0125 Progress Update
+
+I first ran a full OpenLab collect across all 25 public games, but the overall trajectory quality was weak. One long run saved 1057 episodes before timing out, but only 64 episodes had nonzero score, all 64 came from `lp85`, there were 0 wins, and the maximum level reached was only 1. This told me that the main problem was not the training loop yet, but the fact that collect was still producing too many low value trajectories.
+
+I then inspected the runs with GIFs and found a repeated pattern of meaningless exploration. In several games, the agent kept repeating short action templates, reused `ACTION6` with little effect, or reached level 1 and then stalled instead of continuing productively. I responded by adding stronger loop penalties, stronger penalties for no effect coordinate clicks, short rollout based probing, and earlier stopping when a run collapses after making progress. These changes improved a few cases, but most games still get stuck at level 0, so the current method is not solved yet.
+
+The latest OpenLab run produced a few better level 1 examples in `sp80`, `lp85`, and `ar25`. I am keeping these examples visible because they help me compare “real progress” against empty motion loops and understand where the agent still gets stuck after entering the next level.
+
+### Example GIFs
+
+**`sp80` level 1, then `GAME_OVER`**
+
+![sp80 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top02_sp80_lvl1_gameover_seed200013_try1/breadth_all_sp80_seed200013_try1_GAME_OVER_lvl1_score4p762_act63.gif)
+
+**`lp85` level 1, then `NOT_FINISHED`**
+
+![lp85 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top03_lp85_lvl1_not_finished_seed200011_try0/breadth_all_lp85_seed200011_try0_NOT_FINISHED_lvl1_score2p778_act112.gif)
+
+**`ar25` level 1, then `NOT_FINISHED`**
+
+![ar25 level 1 case](./Local_Output/Inspect/openlab_collect_best_v3_20260425_top_cases/top04_ar25_lvl1_not_finished_seed200004_try1/breadth_all_ar25_seed200004_try1_NOT_FINISHED_lvl1_score2p778_act112.gif)
+
+## My Suggestion
+
+I suggest that I stop treating all 25 games as equally important during early method validation. Instead, I should focus on a small five game set: `sp80`, `lp85`, and `ar25` as the positive core, plus `ls20` and `r11l` as control games that expose stalling and death loops. This should let me verify whether the collect and train loop is genuinely learning, or only memorizing a few lucky cases.
+
+I also think a team based workflow is practical here. If each teammate focuses on a small subset of games, tunes collect on a separate branch, and exports a higher quality `episodes.jsonl.gz`, I can merge those files during training and learn one shared checkpoint from all of them together. The training code now supports multiple input trajectory files through a comma separated `--data` argument, so I can combine experience from several focused `.gz` files into one `.pth` checkpoint.
+
+Example:
+
+```bash
+python -m src.train \
+  --project-root "." \
+  --data './path/to/member_a.gz,./path/to/member_b.gz,./path/to/member_c.gz' \
+  --output-dir './Local_Output/Training/team_focus_train_v1'
+```
+
 This repo contains a minimal end to end pipeline for ARC AGI 3.
 
 The current method uses structured search on 25 public games to collect useful trajectories, then trains a compact object centric policy model from those trajectories. The model predicts the next action, the click position for `ACTION6`, a value estimate & a small transition target for the next latent state. At inference time, the agent uses the trained policy together with short term memory about action effects, progress, and previously tried coordinates.
