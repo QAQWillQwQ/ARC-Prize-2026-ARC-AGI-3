@@ -23,6 +23,8 @@ from .common import (
 )
 from .model import build_model, load_checkpoint
 
+OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
+
 
 @dataclass
 class PolicyOutput:
@@ -105,6 +107,9 @@ class PolicyGuidedAgent:
         self.last_action_id: Optional[int] = None
         self.steps_since_progress = 0
         self.seen_signatures: List[str] = []
+        self.recent_signatures: Deque[str] = deque(maxlen=16)
+        self.action_history: Deque[int] = deque(maxlen=12)
+        self.coord_history: Deque[Tuple[int, int]] = deque(maxlen=12)
         self.action_effect: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points: Dict[Tuple[int, int], int] = {}
@@ -132,9 +137,64 @@ class PolicyGuidedAgent:
         self.last_action_id = None
         self.steps_since_progress = 0
         self.seen_signatures = [frame_hash(frame)]
+        self.recent_signatures = deque([self.seen_signatures[0]], maxlen=16)
+        self.action_history = deque(maxlen=12)
+        self.coord_history = deque(maxlen=12)
         self.action_effect = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points = {}
+
+    def _recent_repeat_penalty(self, action_id: int) -> float:
+        if not self.action_history:
+            return 0.0
+        history = list(self.action_history)
+        penalty = 0.0
+
+        if self.last_action_id is not None and OPPOSITE_ACTION_IDS.get(self.last_action_id) == action_id:
+            penalty += 0.6 + min(self.steps_since_progress * 0.02, 0.4)
+
+        same_tail = 0
+        for existing in reversed(history):
+            if existing == action_id:
+                same_tail += 1
+            else:
+                break
+        if same_tail >= 2:
+            penalty += min(0.15 * float(same_tail - 1), 0.45)
+
+        if len(history) >= 3 and history[-3] == history[-1] and action_id == history[-2]:
+            penalty += 0.9
+        if len(history) >= 5 and history[-5] == history[-3] == history[-1] and action_id == history[-2] == history[-4]:
+            penalty += 1.1
+
+        if self.steps_since_progress >= max(6, self.stall_steps // 3):
+            penalty *= 1.35
+        return penalty
+
+    def _coord_repeat_penalty(self, point: Tuple[int, int]) -> float:
+        penalty = 0.08 * float(self.tried_points.get(point, 0))
+        if not self.coord_history:
+            return penalty
+
+        repeated = 0
+        close_recent = 0
+        for previous in self.coord_history:
+            distance = abs(previous[0] - point[0]) + abs(previous[1] - point[1])
+            if distance == 0:
+                repeated += 1
+            if distance <= 2:
+                close_recent += 1
+        penalty += min(0.12 * float(repeated), 0.6)
+        if close_recent >= 3:
+            penalty += min(0.06 * float(close_recent - 2), 0.4)
+        return penalty
+
+    def _coord_distance_bonus(self, point: Tuple[int, int]) -> float:
+        if not self.coord_history:
+            return 0.0
+        last_x, last_y = self.coord_history[-1]
+        distance = abs(last_x - point[0]) + abs(last_y - point[1])
+        return min(distance / 48.0, 0.35)
 
     def _policy_output(
         self,
@@ -198,6 +258,9 @@ class PolicyGuidedAgent:
                         score += 0.45
                     if action_id in self.risky_actions:
                         score -= 0.5
+                    score += self._coord_distance_bonus((x, y))
+                    score -= self._recent_repeat_penalty(action_id)
+                    score -= self._coord_repeat_penalty((x, y))
                     if output is None:
                         score += self.rng.uniform(0.0, 0.05)
                     candidates.append(
@@ -219,6 +282,7 @@ class PolicyGuidedAgent:
                     score -= 0.5
                 if self.last_action_id == action_id and self.steps_since_progress > 2:
                     score -= 0.1
+                score -= self._recent_repeat_penalty(action_id)
                 if output is None:
                     score += self.rng.uniform(0.0, 0.05)
                 candidates.append(
@@ -264,17 +328,43 @@ class PolicyGuidedAgent:
         delta = frame_delta(previous_frame, next_frame)
         signature = frame_hash(next_frame)
         novelty = novelty_bonus(signature, self.seen_signatures)
+        repeated_recent = int(signature in self.recent_signatures)
+        reverse = int(self.last_action_id is not None and OPPOSITE_ACTION_IDS.get(self.last_action_id) == action.action_id)
+        two_cycle = int(
+            len(self.action_history) >= 3
+            and self.action_history[-3] == self.action_history[-1]
+            and action.action_id == self.action_history[-2]
+        )
+        progress_gain = max(0, int(levels_after) - int(levels_before))
         self.seen_signatures.append(signature)
-        self.action_effect[action.action_id] = (self.action_effect[action.action_id] * 0.8) + (delta / 4096.0) * 0.2
+        self.recent_signatures.append(signature)
+        delta_term = min(delta / 256.0, 1.0)
+        utility = (
+            (float(progress_gain) * 1.2)
+            + (novelty * 0.18)
+            + (delta_term * 0.08)
+            - (0.45 if repeated_recent else 0.0)
+            - (0.55 if reverse and progress_gain == 0 else 0.0)
+            - (0.7 if two_cycle and progress_gain == 0 else 0.0)
+            - (0.12 if delta == 0 else 0.0)
+        )
+        if self.steps_since_progress >= max(6, self.stall_steps // 3) and progress_gain == 0:
+            utility -= 0.08
+        if action.action_id == 6 and action.action_data is not None:
+            point = (int(action.action_data["x"]), int(action.action_data["y"]))
+            utility -= self._coord_repeat_penalty(point) * 0.35
+            self.coord_history.append(point)
+        self.action_effect[action.action_id] = (self.action_effect[action.action_id] * 0.7) + utility * 0.3
         if levels_after > levels_before:
             self.action_success[action.action_id] = (self.action_success[action.action_id] * 0.5) + 0.5
             self.steps_since_progress = 0
         else:
-            self.action_success[action.action_id] *= 0.98
+            self.action_success[action.action_id] *= 0.94 if repeated_recent or reverse or two_cycle else 0.98
             self.steps_since_progress += 1
         if action.action_id == 6 and action.action_data is not None:
             point = (int(action.action_data["x"]), int(action.action_data["y"]))
             self.tried_points[point] = self.tried_points.get(point, 0) + 1
+        self.action_history.append(action.action_id)
         self.last_action_id = action.action_id
         self.history_frames.append([[int(value) for value in row] for row in next_frame])
         return novelty

@@ -9,8 +9,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from arcengine import GameAction
 
+from .agent import PolicyGuidedAgent
 from .collect import build_arcade, collect_episode_task, curriculum_key, format_duration
 from .common import (
+    CandidateAction,
     append_jsonl_gz,
     final_subframe,
     frame_delta,
@@ -141,6 +143,85 @@ def probe_transition_score(
     return score, delta_pixels
 
 
+def run_probe_rollout(
+    arc: Any,
+    game_id: str,
+    seed: int,
+    action_id: int,
+    action_data: Optional[Dict[str, int]],
+    probe_horizon: int = 6,
+) -> Tuple[float, bool]:
+    env = arc.make(game_id, seed=int(seed))
+    if env is None or env.observation_space is None:
+        return 0.0, False
+
+    raw_obs = env.observation_space
+    initial_frame = final_subframe(raw_obs.frame)
+    agent = PolicyGuidedAgent(
+        checkpoint_path=None,
+        history=4,
+        max_steps=probe_horizon,
+        stall_steps=8,
+        reset_limit=0,
+        coord_budget=8,
+        random_seed=int(seed),
+        game_prior={},
+    )
+    agent.reset_memory(initial_frame)
+
+    total_score = 0.0
+    previous_frame = initial_frame
+    current_candidate = CandidateAction(
+        action_id=int(action_id),
+        action_data=dict(action_data or {}),
+        score=0.0,
+        source="probe",
+    )
+
+    for step_index in range(probe_horizon):
+        next_obs = env.step(GameAction.from_id(current_candidate.action_id), data=current_candidate.action_data or {})
+        if next_obs is None:
+            break
+        next_frame = final_subframe(next_obs.frame)
+        state_name = next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state)
+        step_score, delta_pixels = probe_transition_score(
+            previous_frame=previous_frame,
+            next_frame=next_frame,
+            state_name=state_name,
+            levels_before=int(raw_obs.levels_completed),
+            levels_after=int(next_obs.levels_completed),
+        )
+        novelty = agent.update_memory(
+            action=current_candidate,
+            previous_frame=previous_frame,
+            next_frame=next_frame,
+            levels_before=int(raw_obs.levels_completed),
+            levels_after=int(next_obs.levels_completed),
+        )
+        step_score += (novelty - 0.5) * 0.6
+        if delta_pixels <= 0:
+            step_score -= 0.25
+        total_score += step_score * (0.86 ** step_index)
+
+        if state_name == "WIN":
+            total_score += 20.0
+            return total_score, True
+        if state_name == "GAME_OVER":
+            total_score -= 2.0
+            return total_score, True
+
+        raw_obs = next_obs
+        previous_frame = next_frame
+        current_candidate = agent.choose_action(
+            frame=agent.history_frames[-1],
+            prev_frame=agent.history_frames[-2] if len(agent.history_frames) > 1 else None,
+            available_actions=list(getattr(raw_obs, "available_actions", [])),
+            levels_completed=int(raw_obs.levels_completed),
+            step_index=step_index + 1,
+        )
+    return total_score, False
+
+
 def run_probe_stage(
     project_root: Path,
     output_root: Path,
@@ -175,27 +256,19 @@ def run_probe_stage(
 
             def record_trial(action_id: int, action_data: Optional[Dict[str, int]]) -> None:
                 nonlocal total_trials, total_gameovers
-                trial_env = arc.make(game_id, seed=int(seed))
-                if trial_env is None or trial_env.observation_space is None:
-                    return
-                trial_obs = trial_env.observation_space
-                next_obs = trial_env.step(GameAction.from_id(action_id), data=action_data or {})
-                if next_obs is None:
-                    return
-                next_frame = final_subframe(next_obs.frame)
-                state_name = next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state)
-                score, _ = probe_transition_score(
-                    previous_frame=initial_frame,
-                    next_frame=next_frame,
-                    state_name=state_name,
-                    levels_before=levels_before,
-                    levels_after=int(next_obs.levels_completed),
+                score, terminated = run_probe_rollout(
+                    arc=arc,
+                    game_id=game_id,
+                    seed=int(seed),
+                    action_id=int(action_id),
+                    action_data=dict(action_data or {}),
+                    probe_horizon=6,
                 )
                 action_totals[action_id] = action_totals.get(action_id, 0.0) + score
                 action_counts[action_id] = action_counts.get(action_id, 0) + 1
-                action_gameovers[action_id] = action_gameovers.get(action_id, 0) + int(state_name == "GAME_OVER")
+                action_gameovers[action_id] = action_gameovers.get(action_id, 0) + int(terminated and score < 0.0)
                 total_trials += 1
-                total_gameovers += int(state_name == "GAME_OVER")
+                total_gameovers += int(terminated and score < 0.0)
                 if action_id == 6 and action_data is not None:
                     point = (int(action_data["x"]), int(action_data["y"]))
                     coord_totals[point] = coord_totals.get(point, 0.0) + score

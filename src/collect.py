@@ -26,6 +26,8 @@ from .common import (
     utc_timestamp,
 )
 
+OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
+
 
 @dataclass
 class SearchItem:
@@ -187,12 +189,33 @@ def replay_sequence(
     state_name = raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
     total_novelty = float(sum(float(transition["novelty"]) for transition in transitions))
     total_delta = int(sum(int(transition["delta_pixels"]) for transition in transitions))
-    unique_frames = len(
-        {
-            frame_hash(transition["next_frame"])
-            for transition in transitions
-        }
+    next_frame_hashes = [frame_hash(transition["next_frame"]) for transition in transitions]
+    unique_frames = len(set(next_frame_hashes))
+    repeated_frames = max(0, len(next_frame_hashes) - unique_frames)
+    action_ids = [int(transition["action_id"]) for transition in transitions]
+    reverse_pairs = sum(
+        1
+        for previous, current in zip(action_ids, action_ids[1:])
+        if OPPOSITE_ACTION_IDS.get(previous) == current
     )
+    oscillation_pairs = sum(
+        1
+        for idx in range(3, len(action_ids))
+        if action_ids[idx - 3] == action_ids[idx - 1] and action_ids[idx - 2] == action_ids[idx]
+    )
+    repeated_coord_actions = 0
+    last_coord: Optional[tuple[int, int]] = None
+    for transition in transitions:
+        if int(transition["action_id"]) != 6:
+            continue
+        action_data = dict(transition.get("action_data") or {})
+        point = (int(action_data.get("x", -1)), int(action_data.get("y", -1)))
+        if last_coord == point:
+            repeated_coord_actions += 1
+        last_coord = point
+    no_progress_penalty = 0.0
+    if float(score_info["score"]) <= 0.0 and int(raw_obs.levels_completed) == 0:
+        no_progress_penalty = max(0.0, (len(transitions) - 24) * 0.22)
     episode = {
         "game_id": game_id,
         "seed": seed,
@@ -206,6 +229,10 @@ def replay_sequence(
         "total_novelty": total_novelty,
         "total_delta_pixels": total_delta,
         "unique_frames": unique_frames,
+        "repeated_frames": repeated_frames,
+        "reverse_pairs": reverse_pairs,
+        "oscillation_pairs": oscillation_pairs,
+        "repeated_coord_actions": repeated_coord_actions,
         "transitions": transitions,
     }
     signature = "%s:%s:%s" % (
@@ -217,11 +244,16 @@ def replay_sequence(
         (int(raw_obs.levels_completed) * 1000.0)
         + float(score_info["score"]) * 4.0
         + (500.0 if state_name == "WIN" else 0.0)
-        + min(total_delta / 32.0, 60.0)
-        + (total_novelty * 8.0)
-        + (unique_frames * 1.5)
+        + min(total_delta / 64.0, 28.0)
+        + (total_novelty * 3.0)
+        + (unique_frames * 3.0)
         + (10.0 if state_name == "NOT_FINISHED" and len(transitions) > 0 else 0.0)
         - (50.0 if state_name == "GAME_OVER" else 0.0)
+        - (reverse_pairs * 5.0)
+        - (oscillation_pairs * 9.0)
+        - (repeated_frames * 7.0)
+        - (repeated_coord_actions * 2.0)
+        - no_progress_penalty
         - (len(transitions) * 0.15)
     )
     return SearchItem(
