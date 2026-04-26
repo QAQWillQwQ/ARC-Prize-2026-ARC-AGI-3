@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import gzip
+import hashlib
 import html
 import json
 from pathlib import Path
@@ -144,6 +146,35 @@ def infer_motion_centroid(points: Sequence[Tuple[int, int]]) -> Optional[Tuple[f
     x_total = sum(point[0] for point in points)
     y_total = sum(point[1] for point in points)
     return (x_total / len(points), y_total / len(points))
+
+
+def frame_signature(frame: Sequence[Sequence[int]]) -> str:
+    payload = json.dumps(frame, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+
+def score_tag(score: Any) -> str:
+    text = ("%.3f" % float(score)).rstrip("0").rstrip(".")
+    return text.replace(".", "p")
+
+
+def safe_name(text: str) -> str:
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
+    cleaned = "".join(char if char in allowed else "_" for char in text)
+    while "__" in cleaned:
+        cleaned = cleaned.replace("__", "_")
+    return cleaned.strip("_") or "episode"
+
+
+def episode_file_stem(episode: Dict[str, Any]) -> str:
+    parts = [
+        str(episode.get("episode_id") or "episode"),
+        str(episode.get("final_state") or "UNKNOWN"),
+        "lvl%d" % int(episode.get("levels_completed", 0)),
+        "score%s" % score_tag(episode.get("score", 0.0)),
+        "act%d" % int(episode.get("actions_taken", 0)),
+    ]
+    return safe_name("__".join(parts))
 
 
 def render_diff_overlay(
@@ -291,7 +322,13 @@ def render_transition_panel(
     return panel
 
 
-def write_html_summary(output_dir: Path, episode: Dict[str, Any], frame_paths: Sequence[Path]) -> None:
+def write_html_summary(
+    output_dir: Path,
+    episode: Dict[str, Any],
+    frame_paths: Sequence[Path],
+    gif_name: str,
+    html_name: str,
+) -> None:
     rows: List[str] = []
     transitions = list(episode.get("transitions", []))
     for transition, image_path in zip(transitions, frame_paths):
@@ -334,7 +371,7 @@ def write_html_summary(output_dir: Path, episode: Dict[str, Any], frame_paths: S
 <body>
   <h1>Collect Episode Inspection</h1>
   <pre>%s</pre>
-  <p>GIF: <a href="episode.gif">episode.gif</a></p>
+  <p>GIF: <a href="%s">%s</a></p>
   <table>
     <thead>
       <tr>
@@ -349,9 +386,87 @@ def write_html_summary(output_dir: Path, episode: Dict[str, Any], frame_paths: S
 </html>
 """ % (
         html.escape(json.dumps(payload, indent=2, ensure_ascii=True)),
+        html.escape(gif_name),
+        html.escape(gif_name),
         "\n".join(rows),
     )
-    (output_dir / "episode.html").write_text(html_text, encoding="utf-8")
+    (output_dir / html_name).write_text(html_text, encoding="utf-8")
+
+
+def write_trace_csv(output_dir: Path, episode: Dict[str, Any], trace_name: str) -> None:
+    transitions = list(episode.get("transitions", []))
+    rows: List[Dict[str, Any]] = []
+    seen_after: Dict[str, int] = {}
+    prior_after_signature: Optional[str] = None
+
+    for transition in transitions:
+        before_frame = transition["frame"]
+        after_frame = transition["next_frame"]
+        points = changed_points(before_frame, after_frame)
+        centroid = infer_motion_centroid(points)
+        before_signature = frame_signature(before_frame)
+        after_signature = frame_signature(after_frame)
+        seen_after_count = seen_after.get(after_signature, 0)
+        seen_after[after_signature] = seen_after_count + 1
+        rows.append(
+            {
+                "step_index": int(transition.get("step_index", 0)),
+                "action_id": int(transition.get("action_id", 0)),
+                "action_data": json.dumps(transition.get("action_data", {}), ensure_ascii=True, separators=(",", ":")),
+                "delta_pixels": int(transition.get("delta_pixels", 0)),
+                "novelty": float(transition.get("novelty", 0.0)),
+                "levels_before": int(transition.get("levels_before", 0)),
+                "levels_after": int(transition.get("levels_after", 0)),
+                "state_before": str(transition.get("state_before", "")),
+                "state_after": str(transition.get("state_after", "")),
+                "changed_cells": len(points),
+                "motion_centroid_x": "" if centroid is None else "%.3f" % centroid[0],
+                "motion_centroid_y": "" if centroid is None else "%.3f" % centroid[1],
+                "frame_before_sig": before_signature,
+                "frame_after_sig": after_signature,
+                "after_seen_count_before_step": seen_after_count,
+                "returned_to_immediate_previous_frame": int(prior_after_signature == after_signature),
+            }
+        )
+        prior_after_signature = after_signature
+
+    fieldnames = [
+        "step_index",
+        "action_id",
+        "action_data",
+        "delta_pixels",
+        "novelty",
+        "levels_before",
+        "levels_after",
+        "state_before",
+        "state_after",
+        "changed_cells",
+        "motion_centroid_x",
+        "motion_centroid_y",
+        "frame_before_sig",
+        "frame_after_sig",
+        "after_seen_count_before_step",
+        "returned_to_immediate_previous_frame",
+    ]
+    with (output_dir / trace_name).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_action_sequence(output_dir: Path, episode: Dict[str, Any], actions_name: str) -> None:
+    transitions = list(episode.get("transitions", []))
+    action_ids = [str(int(transition.get("action_id", 0))) for transition in transitions]
+    lines = [
+        "episode_id=%s" % str(episode.get("episode_id", "")),
+        "game_id=%s" % str(episode.get("game_id", "")),
+        "final_state=%s" % str(episode.get("final_state", "")),
+        "levels_completed=%d" % int(episode.get("levels_completed", 0)),
+        "score=%.3f" % float(episode.get("score", 0.0)),
+        "actions_taken=%d" % int(episode.get("actions_taken", 0)),
+        "action_sequence=%s" % ",".join(action_ids),
+    ]
+    (output_dir / actions_name).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def save_episode_visuals(
@@ -360,11 +475,18 @@ def save_episode_visuals(
     cell_size: int,
     gif_ms: int,
     gif_only: bool,
-) -> None:
+) -> Dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     transitions = list(episode.get("transitions", []))
     if not transitions:
         raise RuntimeError("Episode %s has no transitions" % episode.get("episode_id"))
+
+    stem = episode_file_stem(episode)
+    gif_name = "%s.gif" % stem
+    html_name = "%s.html" % stem
+    summary_name = "%s_summary.json" % stem
+    trace_name = "%s_trace.csv" % stem
+    actions_name = "%s_actions.txt" % stem
 
     frames: List[Image.Image] = []
     frame_paths: List[Path] = []
@@ -380,7 +502,7 @@ def save_episode_visuals(
         if centroid is not None:
             centroids.append(centroid)
 
-    gif_path = output_dir / "episode.gif"
+    gif_path = output_dir / gif_name
     frames[0].save(
         gif_path,
         save_all=True,
@@ -389,8 +511,23 @@ def save_episode_visuals(
         loop=0,
     )
     if not gif_only:
-        write_html_summary(output_dir=output_dir, episode=episode, frame_paths=frame_paths)
-    (output_dir / "episode_summary.json").write_text(json.dumps(episode, indent=2, ensure_ascii=True), encoding="utf-8")
+        write_html_summary(
+            output_dir=output_dir,
+            episode=episode,
+            frame_paths=frame_paths,
+            gif_name=gif_name,
+            html_name=html_name,
+        )
+    write_trace_csv(output_dir=output_dir, episode=episode, trace_name=trace_name)
+    write_action_sequence(output_dir=output_dir, episode=episode, actions_name=actions_name)
+    (output_dir / summary_name).write_text(json.dumps(episode, indent=2, ensure_ascii=True), encoding="utf-8")
+    return {
+        "gif": gif_path,
+        "html": output_dir / html_name,
+        "summary": output_dir / summary_name,
+        "trace": output_dir / trace_name,
+        "actions": output_dir / actions_name,
+    }
 
 
 def print_episode_summary(episode: Dict[str, Any]) -> None:
@@ -426,7 +563,7 @@ def main() -> None:
     if args.summary_only:
         return
     episode_dir = output_dir / str(args.case_name or episode.get("episode_id") or "episode")
-    save_episode_visuals(
+    saved_paths = save_episode_visuals(
         episode=episode,
         output_dir=episode_dir,
         cell_size=max(4, int(args.cell_size)),
@@ -434,9 +571,12 @@ def main() -> None:
         gif_only=bool(args.gif_only),
     )
     print("saved_visuals =", episode_dir)
-    print("gif =", episode_dir / "episode.gif")
+    print("gif =", saved_paths["gif"])
+    print("trace =", saved_paths["trace"])
+    print("actions =", saved_paths["actions"])
+    print("summary =", saved_paths["summary"])
     if not args.gif_only:
-        print("html =", episode_dir / "episode.html")
+        print("html =", saved_paths["html"])
 
 
 if __name__ == "__main__":
