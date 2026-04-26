@@ -147,7 +147,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_data_paths(raw: str) -> List[Path]:
-    paths = [Path(part.strip()).resolve() for part in raw.split(",") if part.strip()]
+    paths = [Path(part.strip()).expanduser().resolve() for part in raw.split(",") if part.strip()]
     if not paths:
         raise RuntimeError("No valid --data paths were provided.")
     return paths
@@ -157,9 +157,10 @@ def load_episodes(path: Path) -> List[Dict[str, Any]]:
     return list(iter_jsonl_gz(path))
 
 
-def load_episodes_from_paths(paths: Sequence[Path]) -> List[Dict[str, Any]]:
+def load_episodes_from_paths(paths: Sequence[Path | str]) -> List[Dict[str, Any]]:
     episodes: List[Dict[str, Any]] = []
-    for path in paths:
+    for raw_path in paths:
+        path = Path(raw_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError("Collected data not found: %s" % path)
         episodes.extend(load_episodes(path))
