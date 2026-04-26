@@ -1,5 +1,12 @@
 __pycache__/
 *.pyc
+.DS_Store
+.venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 Training_Output/
+Local_Output/
 recordings/
 logs.log

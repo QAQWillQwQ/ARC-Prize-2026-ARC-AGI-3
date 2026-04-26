@@ -60,14 +60,97 @@ The Colab notebook writes outputs to:
 
 `ARC Prize 2026_AGI_3/Training_Output/<timestamp>/`
 
+Cached public trajectory collection can be stored separately at:
+
+`ARC Prize 2026_AGI_3/Collection_Cache/<collect_tag>/`
+
+For a local precompute run on a Mac M3 CPU, a lighter profile is available:
+
+- hardware profile: `m3_cpu`
+- intended use: run `collect` locally once, then reuse the cached `episodes.jsonl.gz` for multiple Colab training runs
+
 The output folder includes:
 
-- `collected/episodes.jsonl.gz`
 - `metrics.csv`
 - `checkpoints/best.pth`
 - `checkpoints/last.pth`
 - `checkpoints/interrupt.pth` when training is stopped manually
 - `summary.json`
+
+The cached collection folder includes:
+
+- `collected/episodes.jsonl.gz`
+
+## Local Collect on Mac M3
+
+You can precompute the public search trajectories on a local Mac M3 CPU, then upload the resulting folder to Google Drive and reuse it in Colab.
+
+On macOS, install dependencies from PyPI in a local virtual environment. The bundled wheel folder includes several Linux-only dependency wheels and should not be used as the main install source on Mac.
+
+Recommended first pass command:
+
+```bash
+cd '/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3'
+python -m src.collect \
+  --project-root "." \
+  --output-root "./Local_Output/Collection_Cache/public_search_m3_v1" \
+  --hardware-profile m3_cpu \
+  --seeds 0,1 \
+  --max-steps 64
+```
+
+This creates:
+
+`./Local_Output/Collection_Cache/public_search_m3_v1/collected/episodes.jsonl.gz`
+
+After the local run finishes, copy the `public_search_m3_v1` folder to:
+
+`ARC Prize 2026_AGI_3/Collection_Cache/public_search_m3_v1/`
+
+Then set:
+
+- `RUN_COLLECTION = False`
+- `COLLECT_TAG = 'public_search_m3_v1'`
+
+in the Colab notebook so training reuses the cached trajectories instead of recollecting them.
+
+## Openlab Collect
+
+For longer CPU-heavy collection runs on UCI ICS Openlab, use Slurm instead of keeping a long interactive shell job. Openlab documentation notes that long-running non-Slurm processes may be reniced or suspended, while Slurm jobs are exempt.
+
+Copy the project to Openlab:
+
+```bash
+rsync -av --delete --exclude '.git' \
+  '/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3/' \
+  yidingw6@openlab.ics.uci.edu:~/arc_agi3/
+```
+
+On Openlab, create a virtual environment and install from the bundled Linux wheels:
+
+```bash
+cd ~/arc_agi3
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip wheel setuptools
+python -m pip install arc_agi_3_wheels/*.whl
+```
+
+Single-node parallel collect on Openlab:
+
+```bash
+cd ~/arc_agi3
+source .venv/bin/activate
+python -m src.collect \
+  --project-root "." \
+  --output-root "./Local_Output/Collection_Cache/openlab_search_v1" \
+  --hardware-profile a100 \
+  --seeds 0,1,2,3 \
+  --max-steps 96 \
+  --workers 16
+```
+
+The `--workers` flag parallelizes collection across CPU processes on one node. Increase it only as far as the node memory and process limits allow.
 
 ## References
 

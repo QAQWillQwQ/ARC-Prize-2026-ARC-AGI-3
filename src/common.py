@@ -97,6 +97,23 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "weight_decay": 0.0,
         "online_val_every": 1000,
     },
+    "m3_cpu": {
+        "batch_size": 8,
+        "grad_accum": 2,
+        "model_dim": 192,
+        "num_slots": 4,
+        "depth": 3,
+        "num_heads": 4,
+        "history": 4,
+        "collect_episodes_per_game": 6,
+        "beam_width": 3,
+        "branch_factor": 5,
+        "coord_budget": 10,
+        "epochs": 8,
+        "lr": 4e-4,
+        "weight_decay": 0.02,
+        "online_val_every": 4,
+    },
 }
 
 

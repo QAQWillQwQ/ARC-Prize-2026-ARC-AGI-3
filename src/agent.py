@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import random
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -83,6 +84,8 @@ class PolicyGuidedAgent:
         stall_steps: int = 24,
         reset_limit: int = 4,
         coord_budget: int = 20,
+        random_seed: Optional[int] = None,
+        game_prior: Optional[Dict[str, Any]] = None,
     ) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -105,6 +108,21 @@ class PolicyGuidedAgent:
         self.action_effect: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points: Dict[Tuple[int, int], int] = {}
+        self.rng = random.Random(random_seed)
+        self.game_prior = dict(game_prior or {})
+        raw_action_scores = dict(self.game_prior.get("action_scores") or {})
+        self.action_prior_scores: Dict[int, float] = {
+            int(action_id): float(score)
+            for action_id, score in raw_action_scores.items()
+            if int(action_id) in ACTION_IDS
+        }
+        self.risky_actions = {int(action_id) for action_id in self.game_prior.get("risky_actions", []) if int(action_id) in ACTION_IDS}
+        self.coord_hint_points: List[Tuple[int, int]] = []
+        for point in self.game_prior.get("coord_hint_points", []):
+            if not isinstance(point, (list, tuple)) or len(point) != 2:
+                continue
+            self.coord_hint_points.append((int(point[0]), int(point[1])))
+        self.coord_hint_set = set(self.coord_hint_points)
 
     def reset_memory(self, initial_frame: Sequence[Sequence[int]]) -> None:
         self.history_frames.clear()
@@ -151,16 +169,37 @@ class PolicyGuidedAgent:
             if action_id not in available_set:
                 continue
             if action_id == 6:
-                coord_points = salient_points(frame, prev_frame=prev_frame, budget=self.coord_budget)
+                coord_points: List[Tuple[int, int]] = []
+                seen_points = set()
+                for point in self.coord_hint_points:
+                    if point not in seen_points:
+                        seen_points.add(point)
+                        coord_points.append(point)
+                for point in salient_points(frame, prev_frame=prev_frame, budget=self.coord_budget):
+                    if point not in seen_points:
+                        seen_points.add(point)
+                        coord_points.append(point)
+                if output is None:
+                    hinted = [point for point in coord_points if point in self.coord_hint_set]
+                    fallback = [point for point in coord_points if point not in self.coord_hint_set]
+                    self.rng.shuffle(fallback)
+                    coord_points = hinted + fallback
                 for x, y in coord_points:
                     score = 0.0
                     if output is not None:
                         score += output.action_scores[ACTION_TO_INDEX[action_id]]
                         score += output.x_scores[x] + output.y_scores[y]
+                    score += self.action_prior_scores.get(action_id, 0.0) * 0.25
                     score += self.action_effect[action_id] * 0.2
                     score += self.action_success[action_id] * 0.4
                     score += 0.1 / float(1 + self.tried_points.get((x, y), 0))
                     score += 0.02 if int(frame[y][x]) != 0 else 0.0
+                    if (x, y) in self.coord_hint_set:
+                        score += 0.45
+                    if action_id in self.risky_actions:
+                        score -= 0.5
+                    if output is None:
+                        score += self.rng.uniform(0.0, 0.05)
                     candidates.append(
                         CandidateAction(
                             action_id=action_id,
@@ -173,10 +212,15 @@ class PolicyGuidedAgent:
                 score = 0.0
                 if output is not None:
                     score += output.action_scores[ACTION_TO_INDEX[action_id]]
+                score += self.action_prior_scores.get(action_id, 0.0) * 0.25
                 score += self.action_effect[action_id] * 0.2
                 score += self.action_success[action_id] * 0.4
+                if action_id in self.risky_actions:
+                    score -= 0.5
                 if self.last_action_id == action_id and self.steps_since_progress > 2:
                     score -= 0.1
+                if output is None:
+                    score += self.rng.uniform(0.0, 0.05)
                 candidates.append(
                     CandidateAction(
                         action_id=action_id,
