@@ -106,10 +106,14 @@ class PolicyGuidedAgent:
         self.history_frames: Deque[List[List[int]]] = deque(maxlen=self.history_size)
         self.last_action_id: Optional[int] = None
         self.steps_since_progress = 0
+        self.current_levels_completed = 0
+        self.zero_delta_streak = 0
+        self.low_delta_streak = 0
         self.seen_signatures: List[str] = []
         self.recent_signatures: Deque[str] = deque(maxlen=16)
         self.action_history: Deque[int] = deque(maxlen=12)
         self.coord_history: Deque[Tuple[int, int]] = deque(maxlen=12)
+        self.delta_history: Deque[int] = deque(maxlen=12)
         self.action_effect: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points: Dict[Tuple[int, int], int] = {}
@@ -136,13 +140,35 @@ class PolicyGuidedAgent:
             self.history_frames.append([row[:] for row in frame])
         self.last_action_id = None
         self.steps_since_progress = 0
+        self.current_levels_completed = 0
+        self.zero_delta_streak = 0
+        self.low_delta_streak = 0
         self.seen_signatures = [frame_hash(frame)]
         self.recent_signatures = deque([self.seen_signatures[0]], maxlen=16)
         self.action_history = deque(maxlen=12)
         self.coord_history = deque(maxlen=12)
+        self.delta_history = deque(maxlen=12)
         self.action_effect = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points = {}
+
+    def _repeated_template_penalty(self, action_id: int) -> float:
+        history = list(self.action_history)
+        penalty = 0.0
+        for span, weight in ((2, 0.35), (3, 0.7), (4, 1.05)):
+            if len(history) < (2 * span) - 1:
+                continue
+            previous = history[-((2 * span) - 1) : -(span - 1)]
+            current = history[-(span - 1) :] + [action_id]
+            if current == previous:
+                penalty += weight
+        return penalty
+
+    def _has_recent_template_loop(self, span: int) -> bool:
+        history = list(self.action_history)
+        if len(history) < span * 2:
+            return False
+        return history[-span:] == history[-(span * 2) : -span]
 
     def _recent_repeat_penalty(self, action_id: int) -> float:
         if not self.action_history:
@@ -160,12 +186,25 @@ class PolicyGuidedAgent:
             else:
                 break
         if same_tail >= 2:
-            penalty += min(0.15 * float(same_tail - 1), 0.45)
+            penalty += min(0.18 * float(same_tail - 1), 0.8)
+            if action_id == 6:
+                penalty += min(0.12 * float(same_tail - 1), 0.9)
 
         if len(history) >= 3 and history[-3] == history[-1] and action_id == history[-2]:
             penalty += 0.9
         if len(history) >= 5 and history[-5] == history[-3] == history[-1] and action_id == history[-2] == history[-4]:
             penalty += 1.1
+        penalty += self._repeated_template_penalty(action_id)
+
+        if self.zero_delta_streak >= 2 and history[-1] == action_id:
+            penalty += min(0.22 * float(self.zero_delta_streak), 1.4)
+        if self.low_delta_streak >= 4 and action_id == 6:
+            penalty += min(0.18 * float(self.low_delta_streak - 3), 1.0)
+        if self.current_levels_completed > 0 and self.steps_since_progress >= max(4, self.stall_steps // 4):
+            if history[-1] == action_id:
+                penalty += 0.3
+            if action_id == 6 and self.zero_delta_streak >= 1:
+                penalty += 0.45
 
         if self.steps_since_progress >= max(6, self.stall_steps // 3):
             penalty *= 1.35
@@ -187,6 +226,8 @@ class PolicyGuidedAgent:
         penalty += min(0.12 * float(repeated), 0.6)
         if close_recent >= 3:
             penalty += min(0.06 * float(close_recent - 2), 0.4)
+        if self.zero_delta_streak >= 2:
+            penalty += min(0.08 * float(self.zero_delta_streak), 0.5)
         return penalty
 
     def _coord_distance_bonus(self, point: Tuple[int, int]) -> float:
@@ -330,12 +371,16 @@ class PolicyGuidedAgent:
         novelty = novelty_bonus(signature, self.seen_signatures)
         repeated_recent = int(signature in self.recent_signatures)
         reverse = int(self.last_action_id is not None and OPPOSITE_ACTION_IDS.get(self.last_action_id) == action.action_id)
+        template_repeat = self._repeated_template_penalty(action.action_id)
         two_cycle = int(
             len(self.action_history) >= 3
             and self.action_history[-3] == self.action_history[-1]
             and action.action_id == self.action_history[-2]
         )
         progress_gain = max(0, int(levels_after) - int(levels_before))
+        stagnant = progress_gain == 0
+        next_zero_delta_streak = self.zero_delta_streak + 1 if stagnant and delta == 0 else 0
+        next_low_delta_streak = self.low_delta_streak + 1 if stagnant and delta <= 2 else 0
         self.seen_signatures.append(signature)
         self.recent_signatures.append(signature)
         delta_term = min(delta / 256.0, 1.0)
@@ -347,9 +392,20 @@ class PolicyGuidedAgent:
             - (0.55 if reverse and progress_gain == 0 else 0.0)
             - (0.7 if two_cycle and progress_gain == 0 else 0.0)
             - (0.12 if delta == 0 else 0.0)
+            - (0.32 if template_repeat > 0.0 and stagnant else 0.0)
         )
         if self.steps_since_progress >= max(6, self.stall_steps // 3) and progress_gain == 0:
             utility -= 0.08
+        if stagnant and delta == 0:
+            utility -= min(0.22 * float(next_zero_delta_streak), 1.2)
+        if stagnant and delta <= 2:
+            utility -= min(0.08 * float(next_low_delta_streak), 0.8)
+        if int(levels_before) > 0 and stagnant:
+            utility -= min(0.05 * float(max(self.steps_since_progress, 0)), 0.8)
+            if delta <= 2:
+                utility -= 0.22
+        if action.action_id == 6 and stagnant and delta == 0:
+            utility -= 1.1
         if action.action_id == 6 and action.action_data is not None:
             point = (int(action.action_data["x"]), int(action.action_data["y"]))
             utility -= self._coord_repeat_penalty(point) * 0.35
@@ -359,15 +415,42 @@ class PolicyGuidedAgent:
             self.action_success[action.action_id] = (self.action_success[action.action_id] * 0.5) + 0.5
             self.steps_since_progress = 0
         else:
-            self.action_success[action.action_id] *= 0.94 if repeated_recent or reverse or two_cycle else 0.98
+            if repeated_recent or reverse or two_cycle or template_repeat > 0.0 or (action.action_id == 6 and delta == 0):
+                self.action_success[action.action_id] *= 0.9
+            else:
+                self.action_success[action.action_id] *= 0.97
             self.steps_since_progress += 1
+        self.current_levels_completed = int(levels_after)
+        self.zero_delta_streak = next_zero_delta_streak
+        self.low_delta_streak = next_low_delta_streak
         if action.action_id == 6 and action.action_data is not None:
             point = (int(action.action_data["x"]), int(action.action_data["y"]))
             self.tried_points[point] = self.tried_points.get(point, 0) + 1
         self.action_history.append(action.action_id)
+        self.delta_history.append(delta)
         self.last_action_id = action.action_id
         self.history_frames.append([[int(value) for value in row] for row in next_frame])
         return novelty
+
+    def should_abort_stalled_run(self) -> bool:
+        if self.current_levels_completed <= 0:
+            return False
+        post_progress_patience = max(8, self.stall_steps // 2)
+        if self.zero_delta_streak >= max(4, post_progress_patience // 2):
+            return True
+        if self.low_delta_streak >= post_progress_patience:
+            return True
+        if self._has_recent_template_loop(4) and self.steps_since_progress >= max(6, post_progress_patience // 2):
+            return True
+        if self._has_recent_template_loop(3) and self.low_delta_streak >= max(4, post_progress_patience // 3):
+            return True
+        if len(self.action_history) >= 8 and all(action_id == 6 for action_id in list(self.action_history)[-8:]) and self.low_delta_streak >= 4:
+            return True
+        if self.steps_since_progress >= post_progress_patience and len(self.delta_history) >= 6:
+            recent = list(self.delta_history)[-6:]
+            if sum(1 for delta in recent if delta == 0) >= 4:
+                return True
+        return False
 
     def play_env(
         self,
@@ -437,6 +520,9 @@ class PolicyGuidedAgent:
             )
             frame = next_frame
             raw_obs = next_obs
+
+            if self.should_abort_stalled_run():
+                break
 
             if self.steps_since_progress >= self.stall_steps:
                 if resets_used >= self.reset_limit:

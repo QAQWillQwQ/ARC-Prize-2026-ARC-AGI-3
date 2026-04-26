@@ -29,6 +29,16 @@ from .common import (
 OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
 
 
+def repeated_template_count(action_ids: Sequence[int], span: int) -> int:
+    count = 0
+    if len(action_ids) < span * 2:
+        return 0
+    for end in range(span * 2, len(action_ids) + 1):
+        if list(action_ids[end - span : end]) == list(action_ids[end - (span * 2) : end - span]):
+            count += 1
+    return count
+
+
 @dataclass
 class SearchItem:
     sequence: List[Dict[str, Any]]
@@ -130,6 +140,7 @@ def replay_sequence(
 
     transitions: List[Dict[str, Any]] = []
     previous_frame = current_frame
+    low_delta_streak = 0
     for step_index, action_spec in enumerate(sequence):
         state_name = raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
         if state_name in ("WIN", "GAME_OVER"):
@@ -144,6 +155,13 @@ def replay_sequence(
         if next_obs is None:
             break
         next_frame = final_subframe(next_obs.frame)
+        delta_pixels = sum(
+            1
+            for y in range(len(previous_frame))
+            for x in range(len(previous_frame[y]))
+            if int(previous_frame[y][x]) != int(next_frame[y][x])
+        )
+        progress_gain = max(0, int(next_obs.levels_completed) - int(raw_obs.levels_completed))
         novelty = agent.update_memory(
             action=candidate,
             previous_frame=previous_frame,
@@ -162,18 +180,21 @@ def replay_sequence(
                 "levels_after": int(next_obs.levels_completed),
                 "state_before": state_name,
                 "state_after": next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state),
-                "delta_pixels": sum(
-                    1
-                    for y in range(len(previous_frame))
-                    for x in range(len(previous_frame[y]))
-                    if int(previous_frame[y][x]) != int(next_frame[y][x])
-                ),
+                "delta_pixels": delta_pixels,
                 "novelty": novelty,
                 "step_index": step_index,
             }
         )
         raw_obs = next_obs
         previous_frame = next_frame
+        if progress_gain == 0 and delta_pixels <= 2:
+            low_delta_streak += 1
+        else:
+            low_delta_streak = 0
+        if agent.should_abort_stalled_run():
+            break
+        if int(raw_obs.levels_completed) > 0 and low_delta_streak >= max(6, int(config.get("stall_steps", 24)) // 2):
+            break
 
     completed_level_actions: List[int] = []
     running_actions = 0
@@ -204,6 +225,11 @@ def replay_sequence(
         if action_ids[idx - 3] == action_ids[idx - 1] and action_ids[idx - 2] == action_ids[idx]
     )
     repeated_coord_actions = 0
+    zero_delta_steps = sum(1 for transition in transitions if int(transition["delta_pixels"]) == 0)
+    low_delta_steps = sum(1 for transition in transitions if int(transition["delta_pixels"]) <= 2)
+    no_effect_action6 = sum(
+        1 for transition in transitions if int(transition["action_id"]) == 6 and int(transition["delta_pixels"]) == 0
+    )
     last_coord: Optional[tuple[int, int]] = None
     for transition in transitions:
         if int(transition["action_id"]) != 6:
@@ -213,6 +239,14 @@ def replay_sequence(
         if last_coord == point:
             repeated_coord_actions += 1
         last_coord = point
+    repeated_templates = repeated_template_count(action_ids, 3) + repeated_template_count(action_ids, 4)
+    last_progress_index = -1
+    for idx, transition in enumerate(transitions):
+        if int(transition["levels_after"]) > int(transition["levels_before"]):
+            last_progress_index = idx
+    post_progress_stall = 0
+    if last_progress_index >= 0:
+        post_progress_stall = max(0, len(transitions) - last_progress_index - 1)
     no_progress_penalty = 0.0
     if float(score_info["score"]) <= 0.0 and int(raw_obs.levels_completed) == 0:
         no_progress_penalty = max(0.0, (len(transitions) - 24) * 0.22)
@@ -233,6 +267,11 @@ def replay_sequence(
         "reverse_pairs": reverse_pairs,
         "oscillation_pairs": oscillation_pairs,
         "repeated_coord_actions": repeated_coord_actions,
+        "zero_delta_steps": zero_delta_steps,
+        "low_delta_steps": low_delta_steps,
+        "no_effect_action6": no_effect_action6,
+        "repeated_templates": repeated_templates,
+        "post_progress_stall": post_progress_stall,
         "transitions": transitions,
     }
     signature = "%s:%s:%s" % (
@@ -253,6 +292,11 @@ def replay_sequence(
         - (oscillation_pairs * 9.0)
         - (repeated_frames * 7.0)
         - (repeated_coord_actions * 2.0)
+        - (zero_delta_steps * 1.1)
+        - (low_delta_steps * 0.18)
+        - (no_effect_action6 * 1.6)
+        - (repeated_templates * 6.0)
+        - (post_progress_stall * 0.45)
         - no_progress_penalty
         - (len(transitions) * 0.15)
     )
