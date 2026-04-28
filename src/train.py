@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -37,75 +38,110 @@ from .model import build_model, load_checkpoint, save_checkpoint
 
 class EpisodeTransitionDataset(Dataset):
     def __init__(self, episodes: Sequence[Dict[str, Any]], history: int, max_steps: int) -> None:
-        self.samples: List[Dict[str, Any]] = []
+        self.episodes: List[Dict[str, Any]] = []
+        self.sample_index: List[Tuple[int, int]] = []
         self.history = history
         self.max_steps = max_steps
 
         for episode in episodes:
-            transitions = list(episode.get("transitions", []))
-            if not transitions:
+            raw_transitions = list(episode.get("transitions", []))
+            if not raw_transitions:
                 continue
-            rewards = [transition_reward(transition) for transition in transitions]
+            rewards = [transition_reward(transition) for transition in raw_transitions]
             returns = compute_discounted_returns(rewards)
 
+            frames: List[List[List[int]]] = [raw_transitions[0]["frame"]]
+            transitions: List[Dict[str, Any]] = []
+            last_action_before: List[Optional[int]] = []
+            steps_before: List[int] = []
             last_action_id: Optional[int] = None
             steps_since_progress = 0
-            frames_so_far: List[List[List[int]]] = []
-            for idx, transition in enumerate(transitions):
-                frame = transition["frame"]
-                next_frame = transition["next_frame"]
-                history_frames = pad_history(frames_so_far + [frame], history=self.history)
-                next_history_frames = pad_history(frames_so_far + [frame, next_frame], history=self.history)
+
+            for transition in raw_transitions:
+                action_id = int(transition["action_id"])
                 progress = int(transition["levels_after"]) - int(transition["levels_before"])
-                next_transition = transitions[idx + 1] if idx + 1 < len(transitions) else transition
-                next_steps_since_progress = 0 if progress > 0 else steps_since_progress + 1
-                sample = {
-                    "obs": one_hot_frames(history_frames),
-                    "next_obs": one_hot_frames(next_history_frames),
-                    "scalar": scalar_features(
-                        available_actions=transition["available_actions"],
-                        last_action_id=last_action_id,
-                        levels_completed=int(transition["levels_before"]),
-                        steps_since_progress=steps_since_progress,
-                        step_index=idx,
-                        frame=history_frames[-1],
-                        max_steps=self.max_steps,
-                    ),
-                    "next_scalar": scalar_features(
-                        available_actions=next_transition["available_actions"],
-                        last_action_id=int(transition["action_id"]),
-                        levels_completed=int(transition["levels_after"]),
-                        steps_since_progress=next_steps_since_progress,
-                        step_index=idx + 1,
-                        frame=next_history_frames[-1],
-                        max_steps=self.max_steps,
-                    ),
-                    "available_mask": torch.tensor(action_mask(transition["available_actions"]), dtype=torch.float32),
-                    "action_index": torch.tensor(ACTION_TO_INDEX[int(transition["action_id"])], dtype=torch.long),
-                    "x": torch.tensor(int((transition.get("action_data") or {}).get("x", 0)), dtype=torch.long),
-                    "y": torch.tensor(int((transition.get("action_data") or {}).get("y", 0)), dtype=torch.long),
-                    "coord_mask": torch.tensor(1.0 if int(transition["action_id"]) == 6 else 0.0, dtype=torch.float32),
-                    "return_target": torch.tensor(float(returns[idx]), dtype=torch.float32),
-                    "weight": torch.tensor(
-                        1.0
-                        + (float(episode.get("score", 0.0)) / 100.0)
-                        + max(0, progress) * 2.0,
-                        dtype=torch.float32,
-                    ),
-                }
-                self.samples.append(sample)
-                last_action_id = int(transition["action_id"])
-                frames_so_far.append(frame)
+                last_action_before.append(last_action_id)
+                steps_before.append(steps_since_progress)
+                transitions.append(
+                    {
+                        "available_actions": [int(value) for value in transition["available_actions"]],
+                        "action_id": action_id,
+                        "action_data": dict(transition.get("action_data") or {}),
+                        "levels_before": int(transition["levels_before"]),
+                        "levels_after": int(transition["levels_after"]),
+                    }
+                )
+                frames.append(transition["next_frame"])
+                last_action_id = action_id
                 if progress > 0:
                     steps_since_progress = 0
                 else:
                     steps_since_progress += 1
 
+            episode_index = len(self.episodes)
+            self.episodes.append(
+                {
+                    "transitions": transitions,
+                    "frames": frames,
+                    "returns": returns,
+                    "score": float(episode.get("score", 0.0)),
+                    "last_action_before": last_action_before,
+                    "steps_before": steps_before,
+                }
+            )
+            self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
+
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.sample_index)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        return self.samples[index]
+        episode_index, transition_index = self.sample_index[index]
+        episode = self.episodes[episode_index]
+        transitions = episode["transitions"]
+        transition = transitions[transition_index]
+        next_transition = transitions[transition_index + 1] if transition_index + 1 < len(transitions) else transition
+        frames = episode["frames"]
+
+        history_frames = pad_history(frames[: transition_index + 1], history=self.history)
+        next_history_frames = pad_history(frames[: transition_index + 2], history=self.history)
+        progress = int(transition["levels_after"]) - int(transition["levels_before"])
+        next_steps_since_progress = 0 if progress > 0 else int(episode["steps_before"][transition_index]) + 1
+        action_id = int(transition["action_id"])
+
+        return {
+            "obs": one_hot_frames(history_frames),
+            "next_obs": one_hot_frames(next_history_frames),
+            "scalar": scalar_features(
+                available_actions=transition["available_actions"],
+                last_action_id=episode["last_action_before"][transition_index],
+                levels_completed=int(transition["levels_before"]),
+                steps_since_progress=int(episode["steps_before"][transition_index]),
+                step_index=transition_index,
+                frame=history_frames[-1],
+                max_steps=self.max_steps,
+            ),
+            "next_scalar": scalar_features(
+                available_actions=next_transition["available_actions"],
+                last_action_id=action_id,
+                levels_completed=int(transition["levels_after"]),
+                steps_since_progress=next_steps_since_progress,
+                step_index=transition_index + 1,
+                frame=next_history_frames[-1],
+                max_steps=self.max_steps,
+            ),
+            "available_mask": torch.tensor(action_mask(transition["available_actions"]), dtype=torch.float32),
+            "action_index": torch.tensor(ACTION_TO_INDEX[action_id], dtype=torch.long),
+            "x": torch.tensor(int((transition.get("action_data") or {}).get("x", 0)), dtype=torch.long),
+            "y": torch.tensor(int((transition.get("action_data") or {}).get("y", 0)), dtype=torch.long),
+            "coord_mask": torch.tensor(1.0 if action_id == 6 else 0.0, dtype=torch.float32),
+            "return_target": torch.tensor(float(episode["returns"][transition_index]), dtype=torch.float32),
+            "weight": torch.tensor(
+                1.0
+                + (float(episode["score"]) / 100.0)
+                + max(0, progress) * 2.0,
+                dtype=torch.float32,
+            ),
+        }
 
 
 def collate(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -421,6 +457,10 @@ def main() -> None:
         history=int(config["history"]),
         max_steps=int(config["max_steps"]),
     )
+    del episodes
+    del train_episodes
+    del val_episodes
+    gc.collect()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
