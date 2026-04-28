@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import zipfile
 from collections import defaultdict
 from dataclasses import dataclass
@@ -10,7 +11,6 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .common import (
     ACTION_IDS,
-    append_jsonl_gz,
     ensure_dir,
     episode_level_actions,
     frame_delta,
@@ -40,6 +40,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--games", type=str, default=None, help="Optional comma separated game ids, e.g. sp80,lp85,ar25.")
     parser.add_argument("--min-levels", type=int, default=0, help="Keep only replays that reach at least this many levels.")
     parser.add_argument("--solved-only", action="store_true", help="Keep only human replays that end in WIN.")
+    parser.add_argument("--progress-every", type=int, default=5, help="Print a progress line every N recordings.")
     parser.add_argument(
         "--top-k-per-game",
         type=int,
@@ -129,6 +130,41 @@ def interactive_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [row for row in rows if "action_input" in row.get("data", {}) and "frame" in row.get("data", {})]
 
 
+ACTION_NAME_TO_ID = {"RESET": 0, **{"ACTION%d" % index: index for index in range(1, 8)}}
+
+
+def normalize_action_id(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return int(raw)
+    if isinstance(raw, float) and raw.is_integer():
+        return int(raw)
+    text = str(raw).strip().upper()
+    if not text:
+        return None
+    if text in ACTION_NAME_TO_ID:
+        return ACTION_NAME_TO_ID[text]
+    if text.isdigit() or (text.startswith("-") and text[1:].isdigit()):
+        return int(text)
+    match = re.fullmatch(r"ACTION[_\s-]*(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def normalize_available_actions(raw_values: Any) -> List[int]:
+    if not isinstance(raw_values, list):
+        return []
+    normalized: List[int] = []
+    for raw in raw_values:
+        action_id = normalize_action_id(raw)
+        if action_id is None or action_id in normalized:
+            continue
+        normalized.append(action_id)
+    return normalized
+
+
 def transition_action_data(action_id: int, raw_data: Dict[str, Any]) -> Optional[Dict[str, int]]:
     if action_id != 6:
         return None
@@ -164,7 +200,7 @@ def build_episode(
         current = current_row.get("data", {})
         previous = context_row.get("data", {})
         action_input = current.get("action_input", {}) or {}
-        action_id = int(action_input.get("id", -1))
+        action_id = normalize_action_id(action_input.get("id"))
 
         if action_id == 0:
             reset_actions += 1
@@ -185,11 +221,13 @@ def build_episode(
         novelty = novelty_bonus(signature, seen_signatures)
         delta_pixels = frame_delta(prev_frame, next_frame)
         raw_action_data = action_input.get("data", {}) or {}
+        if not isinstance(raw_action_data, dict):
+            raw_action_data = {}
 
         transitions.append(
             {
                 "frame": prev_frame,
-                "available_actions": [int(value) for value in (previous.get("available_actions") or [])],
+                "available_actions": normalize_available_actions(previous.get("available_actions") or []),
                 "action_id": action_id,
                 "action_data": transition_action_data(action_id, raw_action_data),
                 "next_frame": next_frame,
@@ -293,32 +331,67 @@ def main() -> None:
     selected_by_game: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     total_seen = 0
     total_written = 0
+    total_candidates = 0
+    ordered: List[Dict[str, Any]] = []
+    progress_every = max(1, int(args.progress_every))
+
+    print(
+        "[human-import] input=%s output=%s games=%s min_levels=%d solved_only=%s top_k_per_game=%s"
+        % (
+            input_path,
+            output_path,
+            ",".join(allowed_games) if allowed_games else "ALL",
+            int(args.min_levels),
+            bool(args.solved_only),
+            args.top_k_per_game,
+        ),
+        flush=True,
+    )
+
+    def report_progress(force: bool = False) -> None:
+        if total_seen == 0:
+            return
+        if not force and total_seen % progress_every != 0:
+            return
+        print(
+            "[human-import] processed=%d candidate_episodes=%d written=%d"
+            % (total_seen, total_candidates, total_written),
+            flush=True,
+        )
 
     if args.top_k_per_game is None:
         for recording in iter_recordings(input_path, allowed_games=allowed_games_set):
             total_seen += 1
             episode = build_episode(recording, metadata_map)
             if episode is None:
+                report_progress()
                 continue
             if not keep_episode(episode, allowed_games, args.min_levels, args.solved_only):
+                report_progress()
                 continue
-            append_jsonl_gz(output_path, episode)
+            total_candidates += 1
+            ordered.append(episode)
             counts_by_game[str(episode["game_id"])] += 1
             total_written += 1
+            report_progress()
     else:
         limit = max(1, int(args.top_k_per_game))
         for recording in iter_recordings(input_path, allowed_games=allowed_games_set):
             total_seen += 1
             episode = build_episode(recording, metadata_map)
             if episode is None:
+                report_progress()
                 continue
             if not keep_episode(episode, allowed_games, args.min_levels, args.solved_only):
+                report_progress()
                 continue
+            total_candidates += 1
             game_id = str(episode["game_id"])
             bucket = selected_by_game[game_id]
             bucket.append(episode)
             bucket.sort(key=ranking_key, reverse=True)
             del bucket[limit:]
+            report_progress()
 
         ordered: List[Dict[str, Any]] = []
         for game_id in sorted(selected_by_game):
@@ -326,7 +399,9 @@ def main() -> None:
             counts_by_game[game_id] = len(bucket)
             total_written += len(bucket)
             ordered.extend(bucket)
-        write_jsonl_gz(output_path, ordered)
+
+    write_jsonl_gz(output_path, ordered)
+    report_progress(force=True)
 
     summary = {
         "input": str(input_path),
@@ -334,6 +409,7 @@ def main() -> None:
         "games": allowed_games,
         "min_levels": int(args.min_levels),
         "solved_only": bool(args.solved_only),
+        "candidate_episodes": total_candidates,
         "top_k_per_game": args.top_k_per_game,
         "recordings_seen": total_seen,
         "episodes_written": total_written,
