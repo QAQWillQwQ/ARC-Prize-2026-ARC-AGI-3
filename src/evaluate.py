@@ -46,6 +46,11 @@ def main() -> None:
     output_path = Path(args.output).resolve()
     metadata_map = load_metadata_map(project_root / "environment_files")
     selected_games = select_games(metadata_map, args.games, args.split)
+    print(
+        "[eval] selected_games=%s"
+        % ",".join(selected_games),
+        flush=True,
+    )
 
     arc = Arcade(
         operation_mode=OperationMode.OFFLINE,
@@ -62,6 +67,7 @@ def main() -> None:
 
     per_game: List[Dict[str, Any]] = []
     for game_id in selected_games:
+        print("[eval] loading game=%s" % game_id, flush=True)
         env = arc.make(game_id)
         if env is None:
             raise RuntimeError("Unable to create environment for %s" % game_id)
@@ -80,6 +86,17 @@ def main() -> None:
                 "final_state": result["final_state"],
             }
         )
+        print(
+            "[eval] game=%s score=%.6f levels_completed=%d actions_taken=%d final_state=%s"
+            % (
+                game_id,
+                float(score_info["score"]),
+                int(result["levels_completed"]),
+                int(result["actions_taken"]),
+                result["final_state"],
+            ),
+            flush=True,
+        )
 
     summary = {
         "checkpoint": args.checkpoint,
@@ -89,6 +106,15 @@ def main() -> None:
         "games": per_game,
     }
     save_json(output_path, summary)
+    print(
+        "[eval] mean_score=%.6f mean_levels_completed=%.6f num_games=%d"
+        % (
+            float(summary["mean_score"]),
+            float(summary["mean_levels_completed"]),
+            int(summary["num_games"]),
+        ),
+        flush=True,
+    )
     print("Saved evaluation to %s" % output_path)
 
 

@@ -233,6 +233,10 @@ def frame_delta(prev_frame: Sequence[Sequence[int]], next_frame: Sequence[Sequen
 
 
 def non_background_density(frame: Sequence[Sequence[int]]) -> float:
+    if torch.is_tensor(frame):
+        if frame.numel() == 0:
+            return 0.0
+        return float((frame != 0).to(dtype=torch.float32).mean().item())
     total = GRID_SIZE * GRID_SIZE
     occupied = 0
     for row in frame:

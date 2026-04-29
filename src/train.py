@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
+import os
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -42,54 +44,60 @@ class EpisodeTransitionDataset(Dataset):
         self.sample_index: List[Tuple[int, int]] = []
         self.history = history
         self.max_steps = max_steps
+        self.num_episodes = 0
 
         for episode in episodes:
-            raw_transitions = list(episode.get("transitions", []))
-            if not raw_transitions:
-                continue
-            rewards = [transition_reward(transition) for transition in raw_transitions]
-            returns = compute_discounted_returns(rewards)
+            self.add_episode(episode)
 
-            frames: List[List[List[int]]] = [raw_transitions[0]["frame"]]
-            transitions: List[Dict[str, Any]] = []
-            last_action_before: List[Optional[int]] = []
-            steps_before: List[int] = []
-            last_action_id: Optional[int] = None
-            steps_since_progress = 0
+    def add_episode(self, episode: Dict[str, Any]) -> bool:
+        raw_transitions = list(episode.get("transitions", []))
+        if not raw_transitions:
+            return False
+        rewards = [transition_reward(transition) for transition in raw_transitions]
+        returns = compute_discounted_returns(rewards)
 
-            for transition in raw_transitions:
-                action_id = int(transition["action_id"])
-                progress = int(transition["levels_after"]) - int(transition["levels_before"])
-                last_action_before.append(last_action_id)
-                steps_before.append(steps_since_progress)
-                transitions.append(
-                    {
-                        "available_actions": [int(value) for value in transition["available_actions"]],
-                        "action_id": action_id,
-                        "action_data": dict(transition.get("action_data") or {}),
-                        "levels_before": int(transition["levels_before"]),
-                        "levels_after": int(transition["levels_after"]),
-                    }
-                )
-                frames.append(transition["next_frame"])
-                last_action_id = action_id
-                if progress > 0:
-                    steps_since_progress = 0
-                else:
-                    steps_since_progress += 1
+        frame_list = [raw_transitions[0]["frame"]]
+        transitions: List[Dict[str, Any]] = []
+        last_action_before: List[Optional[int]] = []
+        steps_before: List[int] = []
+        last_action_id: Optional[int] = None
+        steps_since_progress = 0
 
-            episode_index = len(self.episodes)
-            self.episodes.append(
+        for transition in raw_transitions:
+            action_id = int(transition["action_id"])
+            progress = int(transition["levels_after"]) - int(transition["levels_before"])
+            last_action_before.append(last_action_id)
+            steps_before.append(steps_since_progress)
+            transitions.append(
                 {
-                    "transitions": transitions,
-                    "frames": frames,
-                    "returns": returns,
-                    "score": float(episode.get("score", 0.0)),
-                    "last_action_before": last_action_before,
-                    "steps_before": steps_before,
+                    "available_actions": [int(value) for value in transition["available_actions"]],
+                    "action_id": action_id,
+                    "action_data": dict(transition.get("action_data") or {}),
+                    "levels_before": int(transition["levels_before"]),
+                    "levels_after": int(transition["levels_after"]),
                 }
             )
-            self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
+            frame_list.append(transition["next_frame"])
+            last_action_id = action_id
+            if progress > 0:
+                steps_since_progress = 0
+            else:
+                steps_since_progress += 1
+
+        episode_index = len(self.episodes)
+        self.episodes.append(
+            {
+                "transitions": transitions,
+                "frames": torch.tensor(frame_list, dtype=torch.uint8),
+                "returns": returns,
+                "score": float(episode.get("score", 0.0)),
+                "last_action_before": last_action_before,
+                "steps_before": steps_before,
+            }
+        )
+        self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
+        self.num_episodes += 1
+        return True
 
     def __len__(self) -> int:
         return len(self.sample_index)
@@ -102,15 +110,15 @@ class EpisodeTransitionDataset(Dataset):
         next_transition = transitions[transition_index + 1] if transition_index + 1 < len(transitions) else transition
         frames = episode["frames"]
 
-        history_frames = pad_history(frames[: transition_index + 1], history=self.history)
-        next_history_frames = pad_history(frames[: transition_index + 2], history=self.history)
+        history_frames = self._history_frames(frames, transition_index)
+        next_history_frames = self._history_frames(frames, transition_index + 1)
         progress = int(transition["levels_after"]) - int(transition["levels_before"])
         next_steps_since_progress = 0 if progress > 0 else int(episode["steps_before"][transition_index]) + 1
         action_id = int(transition["action_id"])
 
         return {
-            "obs": one_hot_frames(history_frames),
-            "next_obs": one_hot_frames(next_history_frames),
+            "obs": self._encode_history(history_frames),
+            "next_obs": self._encode_history(next_history_frames),
             "scalar": scalar_features(
                 available_actions=transition["available_actions"],
                 last_action_id=episode["last_action_before"][transition_index],
@@ -143,6 +151,20 @@ class EpisodeTransitionDataset(Dataset):
             ),
         }
 
+    def _history_frames(self, frames: torch.Tensor, end_index: int) -> torch.Tensor:
+        start_index = max(0, end_index - self.history + 1)
+        history_frames = frames[start_index : end_index + 1]
+        if history_frames.shape[0] < self.history:
+            pad = history_frames[0:1].repeat(self.history - history_frames.shape[0], 1, 1)
+            history_frames = torch.cat([pad, history_frames], dim=0)
+        return history_frames
+
+    @staticmethod
+    def _encode_history(history_frames: torch.Tensor) -> torch.Tensor:
+        clipped = history_frames.to(dtype=torch.long).clamp_(0, 15)
+        encoded = F.one_hot(clipped, num_classes=16).permute(0, 3, 1, 2)
+        return encoded.reshape(-1, encoded.shape[-2], encoded.shape[-1]).to(dtype=torch.float32)
+
 
 def collate(batch: Sequence[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     keys = batch[0].keys()
@@ -160,6 +182,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=str, required=True)
     parser.add_argument("--hardware-profile", type=str, default="a100")
+    parser.add_argument("--games", type=str, default=None, help="Optional comma separated game ids to train/evaluate on, e.g. sp80 or sp80,ar25.")
+    parser.add_argument("--split-mode", type=str, default="game", choices=["game", "episode"])
+    parser.add_argument("--episode-val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -179,6 +204,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--checkpoint-every-steps", type=int, default=0)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--log-every-batches", type=int, default=100)
+    parser.add_argument("--data-workers", type=int, default=None)
     return parser.parse_args()
 
 
@@ -189,18 +216,61 @@ def parse_data_paths(raw: str) -> List[Path]:
     return paths
 
 
-def load_episodes(path: Path) -> List[Dict[str, Any]]:
-    return list(iter_jsonl_gz(path))
+def parse_game_filter(raw: Optional[str]) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    games = sorted(set(part.strip() for part in raw.split(",") if part.strip()))
+    return games or None
 
 
-def load_episodes_from_paths(paths: Sequence[Path | str]) -> List[Dict[str, Any]]:
-    episodes: List[Dict[str, Any]] = []
+def episode_split_key(episode: Dict[str, Any]) -> str:
+    for key in ("episode_id", "source_guid"):
+        value = episode.get(key)
+        if value:
+            return str(value)
+    fallback = "|".join(
+        [
+            str(episode.get("game_id", "")),
+            str(episode.get("seed", "")),
+            str(episode.get("actions_taken", "")),
+            str(len(episode.get("transitions", []))),
+        ]
+    )
+    return hashlib.sha1(fallback.encode("utf-8")).hexdigest()
+
+
+def split_episode_keys(keys: Sequence[str], holdout_fraction: float = 0.2) -> Tuple[List[str], List[str]]:
+    unique_keys = sorted(set(str(key) for key in keys if str(key)))
+    if not unique_keys:
+        return [], []
+    if len(unique_keys) == 1:
+        return list(unique_keys), []
+
+    ranked = []
+    for key in unique_keys:
+        digest = hashlib.sha1(("arcagi3-episode-split-" + key).encode("utf-8")).hexdigest()
+        ranked.append((digest, key))
+    ranked.sort()
+    holdout = max(1, int(round(len(unique_keys) * holdout_fraction)))
+    val_keys = sorted(key for _, key in ranked[:holdout])
+    train_keys = sorted(key for _, key in ranked[holdout:])
+    if not train_keys:
+        train_keys = val_keys[1:] or val_keys
+        val_keys = val_keys[:1]
+    return train_keys, val_keys
+
+
+def iter_episodes_from_paths(paths: Sequence[Path | str], allowed_games: Optional[Sequence[str]] = None) -> Iterable[Dict[str, Any]]:
+    allowed = set(str(game_id) for game_id in (allowed_games or []))
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError("Collected data not found: %s" % path)
-        episodes.extend(load_episodes(path))
-    return episodes
+        for episode in iter_jsonl_gz(path):
+            game_id = str(episode.get("game_id", ""))
+            if allowed and game_id not in allowed:
+                continue
+            yield episode
 
 
 def split_episodes(episodes: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[str], List[str]]:
@@ -209,6 +279,84 @@ def split_episodes(episodes: Sequence[Dict[str, Any]]) -> Tuple[List[Dict[str, A
     train_episodes = [episode for episode in episodes if episode["game_id"] in train_games]
     val_episodes = [episode for episode in episodes if episode["game_id"] in val_games]
     return train_episodes, val_episodes, train_games, val_games
+
+
+def discover_game_split(
+    paths: Sequence[Path | str],
+    allowed_games: Optional[Sequence[str]] = None,
+    progress_every: int = 25,
+) -> Tuple[List[str], List[str], int]:
+    print(
+        "[data] discovering train/val game split from %d data file(s)"
+        % len(paths),
+        flush=True,
+    )
+    game_ids: List[str] = []
+    unique_games = set()
+    episode_count = 0
+    for episode in iter_episodes_from_paths(paths, allowed_games=allowed_games):
+        game_id = str(episode["game_id"])
+        game_ids.append(game_id)
+        unique_games.add(game_id)
+        episode_count += 1
+        if progress_every > 0 and episode_count % progress_every == 0:
+            print(
+                "[data] split pass episodes=%d unique_games=%d"
+                % (episode_count, len(unique_games)),
+                flush=True,
+            )
+    train_games, val_games = split_games(game_ids)
+    print(
+        "[data] split pass complete episodes=%d unique_games=%d train_games=%d val_games=%d"
+        % (episode_count, len(unique_games), len(train_games), len(val_games)),
+        flush=True,
+    )
+    return train_games, val_games, episode_count
+
+
+def discover_episode_split(
+    paths: Sequence[Path | str],
+    allowed_games: Optional[Sequence[str]] = None,
+    holdout_fraction: float = 0.2,
+    progress_every: int = 25,
+) -> Tuple[List[str], List[str], set[str], set[str], int]:
+    print(
+        "[data] discovering train/val episode split from %d data file(s)"
+        % len(paths),
+        flush=True,
+    )
+    episode_keys: List[str] = []
+    unique_games = set()
+    episode_count = 0
+    for episode in iter_episodes_from_paths(paths, allowed_games=allowed_games):
+        unique_games.add(str(episode["game_id"]))
+        episode_keys.append(episode_split_key(episode))
+        episode_count += 1
+        if progress_every > 0 and episode_count % progress_every == 0:
+            print(
+                "[data] split pass episodes=%d unique_games=%d"
+                % (episode_count, len(unique_games)),
+                flush=True,
+            )
+    train_episode_keys, val_episode_keys = split_episode_keys(
+        episode_keys,
+        holdout_fraction=holdout_fraction,
+    )
+    train_games = sorted(unique_games)
+    val_games = sorted(unique_games)
+    print(
+        "[data] split pass complete episodes=%d unique_games=%d train_games=%d val_games=%d train_episodes=%d val_episodes=%d"
+        % (
+            episode_count,
+            len(unique_games),
+            len(train_games),
+            len(val_games),
+            len(train_episode_keys),
+            len(val_episode_keys),
+        ),
+        flush=True,
+    )
+    return train_games, val_games, set(train_episode_keys), set(val_episode_keys), episode_count
 
 
 def move_batch(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -291,8 +439,10 @@ def evaluate_public_score(
     )
     scores: List[float] = []
     for game_id in selected_games:
+        print("[online-val] loading game=%s" % game_id, flush=True)
         env = arc.make(game_id)
         if env is None:
+            print("[online-val] skipped game=%s env_unavailable" % game_id, flush=True)
             continue
         baseline_actions = metadata_map[game_id].get("baseline_actions", [])
         result = agent.play_env(env=env, game_id=game_id, baseline_actions=baseline_actions)
@@ -300,7 +450,9 @@ def evaluate_public_score(
             baseline_actions=baseline_actions,
             completed_level_actions=episode_level_actions(result["transitions"]),
         )
-        scores.append(float(score_info["score"]))
+        score = float(score_info["score"])
+        scores.append(score)
+        print("[online-val] game=%s score=%.6f" % (game_id, score), flush=True)
     return safe_mean(scores)
 
 
@@ -312,24 +464,33 @@ def run_epoch(
     grad_accum: int,
     max_grad_norm: float = 0.0,
     epoch: int = 0,
+    phase: str = "train",
     checkpoint_every_steps: int = 0,
     checkpoint_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    log_every_batches: int = 0,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
 
     total_loss = 0.0
+    total_action_loss = 0.0
+    total_coord_loss = 0.0
+    total_value_loss = 0.0
+    total_avail_loss = 0.0
+    total_latent_loss = 0.0
     total_action_correct = 0.0
     total_action_count = 0.0
     total_coord_correct = 0.0
     total_coord_count = 0.0
     optimizer_steps = 0
+    seen_samples = 0
 
     autocast_enabled = device.type == "cuda"
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
 
     for step, batch in enumerate(loader):
+        batch_size = int(batch["obs"].shape[0])
         batch = move_batch(batch, device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             out = model(
@@ -361,12 +522,17 @@ def run_epoch(
             ).mean(dim=-1)
 
             weights = batch["weight"]
+            action_loss = masked_average(action_loss_per, weights)
+            coord_loss = 0.5 * masked_average(coord_loss_per, weights)
+            value_loss = 0.25 * masked_average(value_loss_per, weights)
+            avail_loss = 0.2 * masked_average(avail_loss_per, weights)
+            latent_loss = 0.1 * masked_average(latent_loss_per, weights)
             loss = (
-                masked_average(action_loss_per, weights)
-                + 0.5 * masked_average(coord_loss_per, weights)
-                + 0.25 * masked_average(value_loss_per, weights)
-                + 0.2 * masked_average(avail_loss_per, weights)
-                + 0.1 * masked_average(latent_loss_per, weights)
+                action_loss
+                + coord_loss
+                + value_loss
+                + avail_loss
+                + latent_loss
             )
 
         if optimizer is not None:
@@ -389,7 +555,13 @@ def run_epoch(
                             }
                         )
 
-        total_loss += float(loss.item()) * batch["obs"].shape[0]
+        seen_samples += batch_size
+        total_loss += float(loss.item()) * batch_size
+        total_action_loss += float(action_loss.item()) * batch_size
+        total_coord_loss += float(coord_loss.item()) * batch_size
+        total_value_loss += float(value_loss.item()) * batch_size
+        total_avail_loss += float(avail_loss.item()) * batch_size
+        total_latent_loss += float(latent_loss.item()) * batch_size
         action_pred = out["action_logits"].argmax(dim=-1)
         total_action_correct += float((action_pred == batch["action_index"]).sum().item())
         total_action_count += float(batch["action_index"].numel())
@@ -401,9 +573,34 @@ def run_epoch(
             total_coord_correct += float((x_correct & y_correct).sum().item())
             total_coord_count += float(coord_mask.sum().item())
 
+        if log_every_batches > 0 and (((step + 1) % log_every_batches == 0) or (step + 1 == len(loader))):
+            running_loss = total_loss / max(seen_samples, 1)
+            running_action_acc = total_action_correct / max(total_action_count, 1.0)
+            running_coord_acc = total_coord_correct / max(total_coord_count, 1.0)
+            print(
+                "[%s] epoch=%d batch=%d/%d samples=%d/%d loss=%.4f action_acc=%.4f coord_acc=%.4f"
+                % (
+                    phase,
+                    epoch,
+                    step + 1,
+                    len(loader),
+                    seen_samples,
+                    len(loader.dataset),
+                    running_loss,
+                    running_action_acc,
+                    running_coord_acc,
+                ),
+                flush=True,
+            )
+
     denom = max(len(loader.dataset), 1)
     return {
         "loss": total_loss / denom,
+        "action_loss": total_action_loss / denom,
+        "coord_loss": total_coord_loss / denom,
+        "value_loss": total_value_loss / denom,
+        "avail_loss": total_avail_loss / denom,
+        "latent_loss": total_latent_loss / denom,
         "action_acc": total_action_correct / max(total_action_count, 1.0),
         "coord_acc": total_coord_correct / max(total_coord_count, 1.0),
     }
@@ -431,35 +628,99 @@ def main() -> None:
         "online_val_every": args.online_val_every,
         "checkpoint_every_steps": args.checkpoint_every_steps,
         "max_grad_norm": args.max_grad_norm,
+        "log_every_batches": args.log_every_batches,
         "max_steps": args.max_steps,
         "stall_steps": args.stall_steps,
         "reset_limit": args.reset_limit,
+        "data_workers": args.data_workers,
     }
     config = merge_config(args.hardware_profile, overrides)
     config["hardware_profile"] = args.hardware_profile
     config["seed"] = args.seed
     data_paths = parse_data_paths(args.data)
+    requested_games = parse_game_filter(args.games)
     config["data"] = [str(path) for path in data_paths]
+    config["games"] = requested_games
+    config["split_mode"] = args.split_mode
+    config["episode_val_fraction"] = args.episode_val_fraction
     save_json(output_dir / "train_config.json", config)
 
-    episodes = load_episodes_from_paths(data_paths)
-    train_episodes, val_episodes, train_games, val_games = split_episodes(episodes)
-    if not train_episodes:
-        raise RuntimeError("No training episodes were found after the game-level split.")
-
+    train_episode_key_set: set[str] = set()
+    val_episode_key_set: set[str] = set()
+    if args.split_mode == "episode":
+        train_games, val_games, train_episode_key_set, val_episode_key_set, discovered_episodes = discover_episode_split(
+            data_paths,
+            allowed_games=requested_games,
+            holdout_fraction=float(args.episode_val_fraction),
+        )
+    else:
+        train_games, val_games, discovered_episodes = discover_game_split(
+            data_paths,
+            allowed_games=requested_games,
+        )
+    train_game_set = set(train_games)
+    val_game_set = set(val_games)
+    print(
+        "[data] building train/val datasets from %d discovered episode(s)"
+        % discovered_episodes,
+        flush=True,
+    )
     train_dataset = EpisodeTransitionDataset(
-        episodes=train_episodes,
+        episodes=[],
         history=int(config["history"]),
         max_steps=int(config["max_steps"]),
     )
     val_dataset = EpisodeTransitionDataset(
-        episodes=val_episodes if val_episodes else train_episodes[:1],
+        episodes=[],
         history=int(config["history"]),
         max_steps=int(config["max_steps"]),
     )
-    del episodes
-    del train_episodes
-    del val_episodes
+    loaded_episodes = 0
+    for episode in iter_episodes_from_paths(data_paths, allowed_games=requested_games):
+        game_id = str(episode["game_id"])
+        if args.split_mode == "episode":
+            split_key = episode_split_key(episode)
+            if split_key in train_episode_key_set:
+                train_dataset.add_episode(episode)
+            elif split_key in val_episode_key_set:
+                val_dataset.add_episode(episode)
+        else:
+            if game_id in train_game_set:
+                train_dataset.add_episode(episode)
+            elif game_id in val_game_set:
+                val_dataset.add_episode(episode)
+        loaded_episodes += 1
+        if loaded_episodes % 25 == 0:
+            print(
+                "[data] build pass episodes=%d/%d train_episodes=%d val_episodes=%d train_samples=%d val_samples=%d"
+                % (
+                    loaded_episodes,
+                    discovered_episodes,
+                    train_dataset.num_episodes,
+                    val_dataset.num_episodes,
+                    len(train_dataset),
+                    len(val_dataset),
+                ),
+                flush=True,
+            )
+    if train_dataset.num_episodes == 0:
+        raise RuntimeError("No training episodes were found after the requested split.")
+    if val_dataset.num_episodes == 0:
+        fallback_episode = next(iter(iter_episodes_from_paths(data_paths, allowed_games=requested_games)), None)
+        if fallback_episode is not None:
+            val_dataset.add_episode(fallback_episode)
+    num_train_episodes = train_dataset.num_episodes
+    num_val_episodes = val_dataset.num_episodes
+    print(
+        "[data] build pass complete train_episodes=%d val_episodes=%d train_samples=%d val_samples=%d"
+        % (
+            num_train_episodes,
+            num_val_episodes,
+            len(train_dataset),
+            len(val_dataset),
+        ),
+        flush=True,
+    )
     gc.collect()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -467,21 +728,35 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    data_workers = config.get("data_workers")
+    if data_workers is None:
+        if device.type == "cuda":
+            cpu_count = os.cpu_count() or 4
+            data_workers = max(2, min(8, cpu_count // 2))
+        else:
+            data_workers = 0
+    data_workers = max(0, int(data_workers))
+
+    loader_kwargs: Dict[str, Any] = {
+        "num_workers": data_workers,
+        "pin_memory": device.type == "cuda",
+        "collate_fn": collate,
+    }
+    if data_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(config["batch_size"]),
         shuffle=True,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate,
+        **loader_kwargs,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(config["batch_size"]),
         shuffle=False,
-        num_workers=0,
-        pin_memory=device.type == "cuda",
-        collate_fn=collate,
+        **loader_kwargs,
     )
 
     model = build_model(config).to(device)
@@ -498,6 +773,10 @@ def main() -> None:
 
     best_metric = float("-inf")
     best_epoch = -1
+    best_action_metric = float("-inf")
+    best_action_epoch = -1
+    best_public_metric = float("-inf")
+    best_public_epoch = -1
     start_epoch = 1
     if args.resume:
         resume_path = Path(args.resume).resolve()
@@ -512,6 +791,11 @@ def main() -> None:
         start_epoch = int(resume_state["start_epoch"])
         best_metric = float(resume_state["best_metric"])
         best_epoch = int(resume_state["best_epoch"])
+        payload = resume_state["payload"]
+        best_action_metric = float(payload.get("best_action_metric", best_metric))
+        best_action_epoch = int(payload.get("best_action_epoch", best_epoch))
+        best_public_metric = float(payload.get("best_public_metric", float("-inf")))
+        best_public_epoch = int(payload.get("best_public_epoch", -1))
         print(
             "Resumed from %s at epoch %d (%s checkpoint)"
             % (
@@ -522,9 +806,33 @@ def main() -> None:
         )
 
     current_epoch = 0
+    print(
+        "Training setup: device=%s profile=%s epochs=%d batch_size=%d grad_accum=%d data_workers=%d train_games=%d val_games=%d train_episodes=%d val_episodes=%d train_samples=%d val_samples=%d"
+        % (
+            device,
+            args.hardware_profile,
+            int(config["epochs"]),
+            int(config["batch_size"]),
+            int(config["grad_accum"]),
+            data_workers,
+            len(train_games),
+            len(val_games),
+            num_train_episodes,
+            num_val_episodes,
+            len(train_dataset),
+            len(val_dataset),
+        ),
+        flush=True,
+    )
+    print("Split mode: %s" % args.split_mode, flush=True)
+    if requested_games:
+        print("Requested games: %s" % ",".join(requested_games), flush=True)
+    print("Train games: %s" % ",".join(train_games), flush=True)
+    print("Val games: %s" % ",".join(val_games), flush=True)
+    print("Data paths: %s" % ",".join(str(path) for path in data_paths), flush=True)
 
     def checkpoint_callback(extra_state: Dict[str, Any]) -> None:
-        save_training_checkpoint(
+        checkpoint_path = save_training_checkpoint(
             checkpoints_dir=checkpoints_dir,
             stem="last",
             model=model,
@@ -534,8 +842,23 @@ def main() -> None:
             best_score=best_metric if best_metric != float("-inf") else 0.0,
             extra_state={
                 "best_epoch": best_epoch,
+                "best_action_metric": best_action_metric,
+                "best_action_epoch": best_action_epoch,
+                "best_public_metric": best_public_metric,
+                "best_public_epoch": best_public_epoch,
                 **extra_state,
             },
+        )
+        print(
+            "[checkpoint] epoch=%d batch_in_epoch=%s optimizer_steps_in_epoch=%s loss=%.4f path=%s"
+            % (
+                int(extra_state.get("epoch", current_epoch)),
+                extra_state.get("batch_in_epoch", "-"),
+                extra_state.get("optimizer_steps_in_epoch", "-"),
+                float(extra_state.get("last_loss", 0.0)),
+                checkpoint_path,
+            ),
+            flush=True,
         )
 
     try:
@@ -549,8 +872,10 @@ def main() -> None:
                 grad_accum=int(config["grad_accum"]),
                 max_grad_norm=float(config.get("max_grad_norm", 0.0)),
                 epoch=epoch,
+                phase="train",
                 checkpoint_every_steps=int(config.get("checkpoint_every_steps", 0)),
                 checkpoint_callback=checkpoint_callback,
+                log_every_batches=int(config.get("log_every_batches", 0)),
             )
             val_metrics = run_epoch(
                 model=model,
@@ -558,6 +883,9 @@ def main() -> None:
                 optimizer=None,
                 device=device,
                 grad_accum=1,
+                epoch=epoch,
+                phase="val",
+                log_every_batches=int(config.get("log_every_batches", 0)),
             )
 
             last_checkpoint = save_training_checkpoint(
@@ -571,12 +899,21 @@ def main() -> None:
                 extra_state={
                     "epoch_complete": True,
                     "best_epoch": best_epoch,
+                    "best_action_metric": best_action_metric,
+                    "best_action_epoch": best_action_epoch,
+                    "best_public_metric": best_public_metric,
+                    "best_public_epoch": best_public_epoch,
                 },
             )
 
             public_val_score = None
             if val_games and epoch % int(config["online_val_every"]) == 0:
                 selected_games = list(val_games)[: max(1, int(args.online_val_games))]
+                print(
+                    "[online-val] epoch=%d starting games=%s"
+                    % (epoch, ",".join(selected_games)),
+                    flush=True,
+                )
                 public_val_score = evaluate_public_score(
                     checkpoint_path=str(last_checkpoint),
                     project_root=project_root,
@@ -586,24 +923,133 @@ def main() -> None:
                     stall_steps=int(config["stall_steps"]),
                     reset_limit=int(config["reset_limit"]),
                 )
+                print(
+                    "[online-val] epoch=%d complete score=%.6f"
+                    % (epoch, float(public_val_score)),
+                    flush=True,
+                )
 
             row = {
                 "epoch": epoch,
                 "train_loss": round(train_metrics["loss"], 6),
+                "train_action_loss": round(train_metrics["action_loss"], 6),
+                "train_coord_loss": round(train_metrics["coord_loss"], 6),
+                "train_value_loss": round(train_metrics["value_loss"], 6),
+                "train_avail_loss": round(train_metrics["avail_loss"], 6),
+                "train_latent_loss": round(train_metrics["latent_loss"], 6),
                 "train_action_acc": round(train_metrics["action_acc"], 6),
                 "train_coord_acc": round(train_metrics["coord_acc"], 6),
                 "val_loss": round(val_metrics["loss"], 6),
+                "val_action_loss": round(val_metrics["action_loss"], 6),
+                "val_coord_loss": round(val_metrics["coord_loss"], 6),
+                "val_value_loss": round(val_metrics["value_loss"], 6),
+                "val_avail_loss": round(val_metrics["avail_loss"], 6),
+                "val_latent_loss": round(val_metrics["latent_loss"], 6),
                 "val_action_acc": round(val_metrics["action_acc"], 6),
                 "val_coord_acc": round(val_metrics["coord_acc"], 6),
                 "public_val_score": None if public_val_score is None else round(public_val_score, 6),
             }
             append_metrics_row(metrics_path, row)
+            print(
+                "[epoch] %d/%d train_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f train_action_acc=%.6f train_coord_acc=%.6f val_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f val_action_acc=%.6f val_coord_acc=%.6f public_val_score=%s"
+                % (
+                    epoch,
+                    int(config["epochs"]),
+                    train_metrics["loss"],
+                    train_metrics["action_loss"],
+                    train_metrics["coord_loss"],
+                    train_metrics["value_loss"],
+                    train_metrics["avail_loss"],
+                    train_metrics["latent_loss"],
+                    train_metrics["action_acc"],
+                    train_metrics["coord_acc"],
+                    val_metrics["loss"],
+                    val_metrics["action_loss"],
+                    val_metrics["coord_loss"],
+                    val_metrics["value_loss"],
+                    val_metrics["avail_loss"],
+                    val_metrics["latent_loss"],
+                    val_metrics["action_acc"],
+                    val_metrics["coord_acc"],
+                    "n/a" if public_val_score is None else ("%.6f" % public_val_score),
+                ),
+                flush=True,
+            )
 
-            selection_metric = public_val_score if public_val_score is not None else val_metrics["action_acc"]
-            if selection_metric > best_metric:
-                best_metric = float(selection_metric)
-                best_epoch = epoch
-                save_training_checkpoint(
+            action_metric = float(val_metrics["action_acc"])
+            if action_metric > best_action_metric:
+                best_action_metric = action_metric
+                best_action_epoch = epoch
+                action_checkpoint = save_training_checkpoint(
+                    checkpoints_dir=checkpoints_dir,
+                    stem="best_action",
+                    model=model,
+                    optimizer=optimizer,
+                    config=config,
+                    epoch=epoch,
+                    best_score=best_action_metric,
+                    extra_state={
+                        "epoch_complete": True,
+                        "best_epoch": best_epoch,
+                        "best_action_metric": best_action_metric,
+                        "best_action_epoch": best_action_epoch,
+                        "best_public_metric": best_public_metric,
+                        "best_public_epoch": best_public_epoch,
+                        "selection_metric_name": "val_action_acc",
+                        "selection_metric": best_action_metric,
+                    },
+                )
+                print("[best-action] epoch=%d metric=%.6f path=%s" % (epoch, best_action_metric, action_checkpoint), flush=True)
+                if best_public_metric == float("-inf"):
+                    best_metric = best_action_metric
+                    best_epoch = best_action_epoch
+                    best_checkpoint = save_training_checkpoint(
+                        checkpoints_dir=checkpoints_dir,
+                        stem="best",
+                        model=model,
+                        optimizer=optimizer,
+                        config=config,
+                        epoch=epoch,
+                        best_score=best_metric,
+                        extra_state={
+                            "epoch_complete": True,
+                            "best_epoch": best_epoch,
+                            "best_action_metric": best_action_metric,
+                            "best_action_epoch": best_action_epoch,
+                            "best_public_metric": best_public_metric,
+                            "best_public_epoch": best_public_epoch,
+                            "selection_metric_name": "val_action_acc",
+                            "selection_metric": best_metric,
+                        },
+                    )
+                    print("[best] source=action epoch=%d metric=%.6f path=%s" % (epoch, best_metric, best_checkpoint), flush=True)
+
+            if public_val_score is not None and float(public_val_score) > best_public_metric:
+                best_public_metric = float(public_val_score)
+                best_public_epoch = epoch
+                best_metric = best_public_metric
+                best_epoch = best_public_epoch
+                public_checkpoint = save_training_checkpoint(
+                    checkpoints_dir=checkpoints_dir,
+                    stem="best_public",
+                    model=model,
+                    optimizer=optimizer,
+                    config=config,
+                    epoch=epoch,
+                    best_score=best_public_metric,
+                    extra_state={
+                        "epoch_complete": True,
+                        "best_epoch": best_epoch,
+                        "best_action_metric": best_action_metric,
+                        "best_action_epoch": best_action_epoch,
+                        "best_public_metric": best_public_metric,
+                        "best_public_epoch": best_public_epoch,
+                        "selection_metric_name": "public_val_score",
+                        "selection_metric": best_public_metric,
+                    },
+                )
+                print("[best-public] epoch=%d metric=%.6f path=%s" % (epoch, best_public_metric, public_checkpoint), flush=True)
+                best_checkpoint = save_training_checkpoint(
                     checkpoints_dir=checkpoints_dir,
                     stem="best",
                     model=model,
@@ -614,9 +1060,15 @@ def main() -> None:
                     extra_state={
                         "epoch_complete": True,
                         "best_epoch": best_epoch,
+                        "best_action_metric": best_action_metric,
+                        "best_action_epoch": best_action_epoch,
+                        "best_public_metric": best_public_metric,
+                        "best_public_epoch": best_public_epoch,
+                        "selection_metric_name": "public_val_score",
                         "selection_metric": best_metric,
                     },
                 )
+                print("[best] source=public epoch=%d metric=%.6f path=%s" % (epoch, best_metric, best_checkpoint), flush=True)
     except KeyboardInterrupt:
         interrupt_checkpoint = save_training_checkpoint(
             checkpoints_dir=checkpoints_dir,
@@ -629,6 +1081,10 @@ def main() -> None:
             extra_state={
                 "epoch_complete": False,
                 "best_epoch": best_epoch,
+                "best_action_metric": best_action_metric,
+                "best_action_epoch": best_action_epoch,
+                "best_public_metric": best_public_metric,
+                "best_public_epoch": best_public_epoch,
                 "status": "interrupted",
             },
         )
@@ -643,6 +1099,10 @@ def main() -> None:
             extra_state={
                 "epoch_complete": False,
                 "best_epoch": best_epoch,
+                "best_action_metric": best_action_metric,
+                "best_action_epoch": best_action_epoch,
+                "best_public_metric": best_public_metric,
+                "best_public_epoch": best_public_epoch,
                 "status": "interrupted",
             },
         )
@@ -650,12 +1110,16 @@ def main() -> None:
             "status": "interrupted",
             "best_epoch": best_epoch,
             "best_metric": best_metric,
+            "best_action_epoch": best_action_epoch,
+            "best_action_metric": best_action_metric,
+            "best_public_epoch": best_public_epoch,
+            "best_public_metric": best_public_metric,
             "resume_checkpoint": str(interrupt_checkpoint),
             "data_paths": [str(path) for path in data_paths],
             "train_games": train_games,
             "val_games": val_games,
-            "num_train_episodes": len(train_episodes),
-            "num_val_episodes": len(val_episodes),
+            "num_train_episodes": num_train_episodes,
+            "num_val_episodes": num_val_episodes,
             "num_train_samples": len(train_dataset),
             "num_val_samples": len(val_dataset),
         }
@@ -667,12 +1131,18 @@ def main() -> None:
         "status": "finished",
         "best_epoch": best_epoch,
         "best_metric": best_metric,
+        "best_action_epoch": best_action_epoch,
+        "best_action_metric": best_action_metric,
+        "best_public_epoch": best_public_epoch,
+        "best_public_metric": best_public_metric,
         "best_checkpoint": str(checkpoints_dir / "best.pth"),
+        "best_action_checkpoint": str(checkpoints_dir / "best_action.pth"),
+        "best_public_checkpoint": str(checkpoints_dir / "best_public.pth"),
         "data_paths": [str(path) for path in data_paths],
         "train_games": train_games,
         "val_games": val_games,
-        "num_train_episodes": len(train_episodes),
-        "num_val_episodes": len(val_episodes),
+        "num_train_episodes": num_train_episodes,
+        "num_val_episodes": num_val_episodes,
         "num_train_samples": len(train_dataset),
         "num_val_samples": len(val_dataset),
     }
