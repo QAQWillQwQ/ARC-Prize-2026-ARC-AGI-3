@@ -1,0 +1,15 @@
+{
+  "checkpoint": "/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3/Local_Output/Single_Game_Experiments/single_game_ar25_20260429_004340/checkpoints/best.pth",
+  "games": [
+    {
+      "actions_taken": 120,
+      "final_state": "NOT_FINISHED",
+      "game_id": "ar25",
+      "levels_completed": 0,
+      "score": 0.0
+    }
+  ],
+  "mean_levels_completed": 0.0,
+  "mean_score": 0.0,
+  "num_games": 1
+}

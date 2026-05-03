@@ -1,0 +1,34 @@
+{
+  "batch_size": 8,
+  "beam_width": 3,
+  "branch_factor": 5,
+  "checkpoint_every_steps": 50,
+  "collect_episodes_per_game": 6,
+  "coord_budget": 10,
+  "data": [
+    "/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3/Local_Output/Single_Game_Experiments/single_game_ar25_20260429_004340/ar25.episodes.jsonl.gz"
+  ],
+  "data_workers": 0,
+  "depth": 3,
+  "episode_val_fraction": 0.2,
+  "epochs": 8,
+  "games": [
+    "ar25"
+  ],
+  "grad_accum": 2,
+  "hardware_profile": "m3_cpu",
+  "history": 4,
+  "log_every_batches": 5,
+  "lr": 0.0004,
+  "max_grad_norm": 1.0,
+  "max_steps": 192,
+  "model_dim": 192,
+  "num_heads": 4,
+  "num_slots": 4,
+  "online_val_every": 4,
+  "reset_limit": 4,
+  "seed": 42,
+  "split_mode": "episode",
+  "stall_steps": 24,
+  "weight_decay": 0.02
+}
