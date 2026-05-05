@@ -1,0 +1,15 @@
+{
+  "_comment": "Focus-5 staged probe collection. Five-game subset for fast method validation.",
+  "games": "sp80,lp85,ar25,ls20,r11l",
+  "episodes_per_game": 32,
+  "budget_allocator": "adaptive",
+  "stage_budgets": {
+    "probe_seed": 4,
+    "exploit_safe": 12,
+    "followup_focus": 8,
+    "rescue_reprobe": 4,
+    "harvest_best": 4
+  },
+  "expected_wallclock_seconds": 600,
+  "label": "probe_focus5_staged"
+}

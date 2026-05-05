@@ -1,0 +1,16 @@
+# ARC-AGI-3 probe-first agent — Python dependencies.
+#
+# Install order (see README.md for full setup):
+#   1. python -m venv .venv313 && .\.venv313\Scripts\Activate.ps1
+#   2. pip install -U pip wheel setuptools
+#   3. pip install ./wheels/arc_agi-0.9.8-py3-none-any.whl
+#      pip install ./wheels/arcengine-0.9.3-py3-none-any.whl
+#   4. pip install --index-url https://download.pytorch.org/whl/cpu torch     # or cu121 for GPU
+#   5. pip install -r requirements.txt
+#
+# Pinned to "compatible" minimums; the pipeline does not rely on bleeding-edge
+# numpy/pillow/matplotlib semantics.
+
+numpy>=1.26
+pillow>=10.0
+matplotlib>=3.8

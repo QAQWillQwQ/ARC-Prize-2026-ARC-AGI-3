@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Pipeline outputs (ignored by default — write into outputs/ which only keeps .gitkeep)
+outputs/**
+!outputs/.gitkeep
+
+# Anything written by training (large, regenerable)
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Episode caches and logs (large, regenerable)
+*.jsonl.gz
+*.log
+recordings/
+tmp_eval_recordings/
+
+# Local configuration overrides
+configs/local_*.json
+local_*.json
+
+# Notebook scratch outputs
+*.ipynb_checkpoints

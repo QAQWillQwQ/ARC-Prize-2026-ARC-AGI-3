@@ -1,0 +1,15 @@
+{
+  "_comment": "Broad first pass over all 25 public games. Produces priors that the harvest pass reads.",
+  "all_public_games": true,
+  "episodes_per_game": 10,
+  "budget_allocator": "adaptive",
+  "stage_budgets": {
+    "probe_seed": 2,
+    "exploit_safe": 4,
+    "followup_focus": 2,
+    "rescue_reprobe": 1,
+    "harvest_best": 1
+  },
+  "expected_wallclock_seconds": 390,
+  "label": "probe_all_broad"
+}

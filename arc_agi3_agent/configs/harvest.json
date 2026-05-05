@@ -1,0 +1,15 @@
+{
+  "_comment": "Harvest pass on triaged-promising games. Reads triage_summary.json from a prior broad run.",
+  "include_labels": "promising,signal_but_stuck,click_promising,movement_promising,followup_strong",
+  "episodes_per_game": 18,
+  "budget_allocator": "adaptive",
+  "stage_budgets": {
+    "probe_seed": 1,
+    "exploit_safe": 4,
+    "followup_focus": 5,
+    "rescue_reprobe": 4,
+    "harvest_best": 4
+  },
+  "expected_wallclock_seconds": 396,
+  "label": "probe_harvest"
+}

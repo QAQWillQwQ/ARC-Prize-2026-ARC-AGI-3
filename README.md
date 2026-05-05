@@ -1,197 +1,164 @@
-# ARC Prize 2026 ARC AGI 3
+# ARC Prize 2026 — ARC-AGI-3
 
-## Yiding 04262026.0125 Progress Update
+A small, self-contained pipeline for ARC-AGI-3: probe-first structured
+search that produces useful trajectories on the public games, plus a
+compact object-centric policy trained from those trajectories.
 
-I first ran a full OpenLab collect across all 25 public games, but the overall trajectory quality was weak. One long run saved 1057 episodes before timing out, but only 64 episodes had nonzero score, all 64 came from `lp85`, there were 0 wins, and the maximum level reached was only 1. This told me that the main problem was not the training loop yet, but the fact that collect was still producing too many low value trajectories.
+This README is the project overview — what the system does and why it is
+built the way it is. For installing the venv, running the pipeline, and
+inspecting outputs, see **[README_SETUP.md](README_SETUP.md)**.
 
-I then inspected the runs with GIFs and found a repeated pattern of meaningless exploration. In several games, the agent kept repeating short action templates, reused `ACTION6` with little effect, or reached level 1 and then stalled instead of continuing productively. I responded by adding stronger loop penalties, stronger penalties for no effect coordinate clicks, short rollout based probing, and earlier stopping when a run collapses after making progress. These changes improved a few cases, but most games still get stuck at level 0, so the current method is not solved yet.
+---
 
-The latest OpenLab run produced a few better level 1 examples in `sp80`, `lp85`, and `ar25`. I am keeping these examples visible because they help me compare “real progress” against empty motion loops and understand where the agent still gets stuck after entering the next level.
+## What the system does
 
-### Example GIFs
+The pipeline is a chain of stages that each leave a plain file behind:
 
-**`sp80` level 1, then `GAME_OVER`**
+```
+collect_probe ──► eval_probe ──► probe_triage ──► harvest pass ──► train
+   (probe-first    (per-episode    (per-game        (warm-start         (one
+   trajectories)    metrics)        labels +         on promising        shared
+                                    priors)          games)              checkpoint)
+```
+
+The trained model predicts the next action, the click position for
+`ACTION6`, a value estimate, and a small transition target for the next
+latent state. At inference time the agent uses this policy together with
+short-term memory of action effects, progress, and previously-tried
+coordinates.
+
+---
+
+## Method
+
+A few intentional choices the pipeline depends on:
+
+**Probe before exploit.** The first ~16 steps of every episode are spent
+deliberately testing every non-coordinate action and sampling a diverse
+set of click candidates. The exploit policy is then derived from what
+those probes observed — action priorities, dead-action pruning, and click
+region scoring all read from probe memory. Probing pays for itself the
+first time it identifies a no-effect action and saves dozens of useless
+steps.
+
+**Effect signatures are the unit of meaning.** Every transition is
+classified into one of `no_change`, `small_change`, `motion_like`,
+`local_toggle`, `global_change`, `progress`, `game_over`, `win`. The agent
+reasons about *what an action did to the world* rather than only whether
+the score changed. The classifier is cheap (frame delta + connected
+components), stateless, and replaceable by a learned one without touching
+the rest of the pipeline.
+
+**Color is observation, not instruction.** Color histograms, dominant-color
+summaries, and change-shape labels (motion-like, localized replacement,
+broad multi-color) are exposed as features. There are no per-game
+"color X means Y" rules anywhere in the code; color affordances are
+learned from observed outcomes and carried forward in the per-game priors.
+
+**Memory persists across env resets within an episode.** Probe memory is
+not cleared by `env.reset()` inside the same `play_env` call. Resetting
+the world does not reset what the agent learned about which actions were
+inert.
+
+**Anti-loop logic is observable.** Repeat penalties, 2-cycle and 3-cycle
+detection, the stagnation escape with cooldown, the local follow-up
+window, and the global-change-triggered reprobe budget all emit counters
+into `loop_metrics.totals` so a regression shows up in the eval JSON
+instead of in the GIF.
+
+**Per-game priors are append-only state.** Dead actions, dead coords,
+promising clicks, color affordances, and stage stats are written to
+`priors/<game_id>.json` and carried forward across stages and across
+runs. Later stages warm-start from them; later runs (e.g. the harvest
+pass) seed themselves by copying the prior folder.
+
+**Triage is observation-driven.** Game labels come from counts on the
+collected episodes — not from a static list of "good games" and not from
+a game-ID lookup. A game can carry several labels at once; harvest reads
+those labels to decide what to revisit.
+
+**One file format end-to-end.** Every collector writes the same
+`episodes.jsonl.gz` shape with extra annotation fields. Eval, triage,
+training, and inspection all read this same file — there is no separate
+intermediate representation to maintain.
+
+---
+
+## Focus-5 and the example trajectories
+
+Method validation runs on a five-game subset:
+
+- `sp80`, `lp85`, `ar25` — positive core (level-1 reachable; useful for
+  measuring real progress)
+- `ls20`, `r11l` — control games that surface stalling and death loops
+
+The full 25-game broad pass and the harvest pass widen the scope after
+focus-5 confirms the pipeline is producing meaningful trajectories.
+
+**`sp80` reaches level 1, then `GAME_OVER`**
 
 ![sp80 level 1 case](docs/gifs/sp80_level1_gameover.gif)
 
-**`lp85` level 1, then `NOT_FINISHED`**
+**`lp85` reaches level 1, then `NOT_FINISHED`**
 
 ![lp85 level 1 case](docs/gifs/lp85_level1_not_finished.gif)
 
-**`ar25` level 1, then `NOT_FINISHED`**
+**`ar25` reaches level 1, then `NOT_FINISHED`**
 
 ![ar25 level 1 case](docs/gifs/ar25_level1_not_finished.gif)
 
-## My Suggestion
+These episodes are what "real progress" looks like in the eval JSON: a
+non-zero `levels_after`, a `progress` signature on at least one
+transition, and a `memory_summary` that tags the action that produced it.
+Empty motion loops show up as the opposite — high `repeat_action_count`,
+all-`no_change` action stats, and a stagnation escape that fires.
 
-I suggest that I stop treating all 25 games as equally important during early method validation. Instead, I should focus on a small five game set: `sp80`, `lp85`, and `ar25` as the positive core, plus `ls20` and `r11l` as control games that expose stalling and death loops. This should let me verify whether the collect and train loop is genuinely learning, or only memorizing a few lucky cases.
+---
 
-I also think a team based workflow is practical here. If each teammate focuses on a small subset of games, tunes collect on a separate branch, and exports a higher quality `episodes.jsonl.gz`, I can merge those files during training and learn one shared checkpoint from all of them together. The training code now supports multiple input trajectory files through a comma separated `--data` argument, so I can combine experience from several focused `.gz` files into one `.pth` checkpoint.
+## Hardware
 
-Example:
+The default starting profile is Colab `A100`, `bf16`. The public
+environment count is small, so search quality and generalization matter
+more than very large model scale; the model size and training loop fit
+on A100 without wasting capacity. H100 works but is not required.
 
-```bash
-python -m src.train \
-  --project-root "." \
-  --data './path/to/member_a.gz,./path/to/member_b.gz,./path/to/member_c.gz' \
-  --output-dir './Local_Output/Training/team_focus_train_v1'
-```
+| Profile          | `model_dim` | `depth` | `num_slots` | `batch_size` | `epochs` | `grad_accum` |
+|---               |---:|---:|---:|---:|---:|---:|
+| A100 (recommended) | 384 | 6 | 8 | 192 | 16 | 1 |
+| RTX 3070 Ti 8 GB   | 256 | 4 | — | 16  | —  | 8 |
 
-This repo contains a minimal end to end pipeline for ARC AGI 3.
+The probe-first collector and the evaluator run fine on a laptop CPU.
+Local timing on a developer machine: focus-5 single-pass is ~100 s, the
+25-game broad pass is ~6.5 min, the harvest pass is ~6.6 min. Only
+training meaningfully benefits from GPU.
 
-The current method uses structured search on 25 public games to collect useful trajectories, then trains a compact object centric policy model from those trajectories. The model predicts the next action, the click position for `ACTION6`, a value estimate & a small transition target for the next latent state. At inference time, the agent uses the trained policy together with short term memory about action effects, progress, and previously tried coordinates.
+---
 
-The repo is intentionally small. The only maintained project code lives in `src/` and `ColabNotebook/`. The bundled `ARC-AGI-3-Agents/` folder & `arc_agi_3_wheels/` folder are kept as official reference assets from the dataset package.
+## Competition notes
 
-## Files
+Implementation follows the public rules checked on April 22, 2026.
 
-- `src/collect.py` collects public game trajectories with structured search
-- `src/train.py` trains the policy model
-- `src/evaluate.py` runs public game evaluation
-- `src/competition.py` runs the agent in competition mode
-- `ColabNotebook/train_arc_agi3_colab.ipynb` is the Colab training entry point
+- Kaggle submissions are generated automatically after the notebook
+  interacts with the competition environments.
+- The competition notebook runs in `Competition Mode`: one scorecard per
+  run, each environment can only be created once, scorecard closed at
+  the end.
+- Local validation uses the current public scoring cap of `115%` per
+  level.
 
-## Competition Notes
+---
 
-The current implementation follows the public rules checked on April 22, 2026.
+## Where to go next
 
-- Kaggle submissions are generated automatically after the notebook interacts with the competition environments
-- The competition notebook runs in `Competition Mode`
-- In `Competition Mode`, the run uses one scorecard and each environment can only be created once
-- The scorecard is closed at the end of the run
+- **Install + run the pipeline →** [README_SETUP.md](README_SETUP.md)
+- **Train on your own collected data →** [README_SETUP.md, "Training"](README_SETUP.md#5-training)
+- **Colab path →** `ColabNotebook/train_arc_agi3_colab.ipynb`
 
-The local validation code uses the current public scoring cap of `115%` per level.
-
-## Hardware Recommendation
-
-The default recommendation for the first training runs is Colab `A100`.
-
-- The public environment count is small, so search quality and generalization matter more than very large model scale
-- The current model size and training loop fit well on A100 without wasting too much capacity
-- H100 can be used, but it is not required for the first version
-
-Suggested starting profile:
-
-- GPU: `A100`
-- Precision: `bf16`
-- `model_dim=384`
-- `depth=6`
-- `num_slots=8`
-- `batch_size=192`
-- `epochs=16`
-
-Fallback profile for `RTX 3070 Ti 8GB`:
-
-- `model_dim=256`
-- `depth=4`
-- `batch_size=16`
-- `grad_accum=8`
-
-## Training Output
-
-The Colab notebook copies project code from:
-
-`ARC Prize 2026 - ARC-AGI-3/`
-
-The Colab notebook writes outputs to:
-
-`ARC Prize 2026_AGI_3/Training_Output/<timestamp>/`
-
-Cached public trajectory collection can be stored separately at:
-
-`ARC Prize 2026_AGI_3/Collection_Cache/<collect_tag>/`
-
-For a local precompute run on a Mac M3 CPU, a lighter profile is available:
-
-- hardware profile: `m3_cpu`
-- intended use: run `collect` locally once, then reuse the cached `episodes.jsonl.gz` for multiple Colab training runs
-
-The output folder includes:
-
-- `metrics.csv`
-- `checkpoints/best.pth`
-- `checkpoints/last.pth`
-- `checkpoints/interrupt.pth` when training is stopped manually
-- `summary.json`
-
-The cached collection folder includes:
-
-- `collected/episodes.jsonl.gz`
-
-## Local Collect on Mac M3
-
-You can precompute the public search trajectories on a local Mac M3 CPU, then upload the resulting folder to Google Drive and reuse it in Colab.
-
-On macOS, install dependencies from PyPI in a local virtual environment. The bundled wheel folder includes several Linux-only dependency wheels and should not be used as the main install source on Mac.
-
-Recommended first pass command:
-
-```bash
-cd '/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3'
-python -m src.collect \
-  --project-root "." \
-  --output-root "./Local_Output/Collection_Cache/public_search_m3_v1" \
-  --hardware-profile m3_cpu \
-  --seeds 0,1 \
-  --max-steps 64
-```
-
-This creates:
-
-`./Local_Output/Collection_Cache/public_search_m3_v1/collected/episodes.jsonl.gz`
-
-After the local run finishes, copy the `public_search_m3_v1` folder to:
-
-`ARC Prize 2026_AGI_3/Collection_Cache/public_search_m3_v1/`
-
-Then set:
-
-- `RUN_COLLECTION = False`
-- `COLLECT_TAG = 'public_search_m3_v1'`
-
-in the Colab notebook so training reuses the cached trajectories instead of recollecting them.
-
-## Openlab Collect
-
-For longer CPU-heavy collection runs on UCI ICS Openlab, use Slurm instead of keeping a long interactive shell job. Openlab documentation notes that long-running non-Slurm processes may be reniced or suspended, while Slurm jobs are exempt.
-
-Copy the project to Openlab:
-
-```bash
-rsync -av --delete --exclude '.git' \
-  '/Users/wangyiding/ARC Prize 2026 - ARC-AGI-3/' \
-  yidingw6@openlab.ics.uci.edu:~/arc_agi3/
-```
-
-On Openlab, create a virtual environment and install from the bundled Linux wheels:
-
-```bash
-cd ~/arc_agi3
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -U pip wheel setuptools
-python -m pip install arc_agi_3_wheels/*.whl
-```
-
-Single-node parallel collect on Openlab:
-
-```bash
-cd ~/arc_agi3
-source .venv/bin/activate
-python -m src.collect \
-  --project-root "." \
-  --output-root "./Local_Output/Collection_Cache/openlab_search_v1" \
-  --hardware-profile a100 \
-  --seeds 0,1,2,3 \
-  --max-steps 96 \
-  --workers 16
-```
-
-The `--workers` flag parallelizes collection across CPU processes on one node. Increase it only as far as the node memory and process limits allow.
+---
 
 ## References
 
-Official competition and toolkit references:
+Official competition and toolkit:
 
 - [Kaggle Competition Overview](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/overview)
 - [Kaggle Competition Data](https://www.kaggle.com/competitions/arc-prize-2026-arc-agi-3/data)

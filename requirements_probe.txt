@@ -1,0 +1,13 @@
+# Minimum dependencies to run the probe-first collector and evaluator on Windows.
+#
+# This file is for the path:
+#   python -m src.collect_probe ...
+#   python -m src.eval_probe ...
+#
+# arc_agi and arcengine are NOT listed here — install them from the bundled
+# pure-Python wheels in arc_agi_3_wheels/ (see README_SETUP.md). The other
+# wheels in that folder are Linux-only and must NOT be installed on Windows.
+#
+# torch is installed separately from the PyTorch index — see README_SETUP.md.
+
+numpy>=1.26
