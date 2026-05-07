@@ -17,13 +17,16 @@ from .common import (
     CandidateAction,
     append_jsonl_gz,
     final_subframe,
+    frame_delta,
     frame_hash,
+    informative_subframe,
     load_metadata_map,
     merge_config,
     rhae_score,
     save_json,
     seed_everything,
     utc_timestamp,
+    visual_saliency_summary,
 )
 
 OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
@@ -91,6 +94,7 @@ def serialize_candidate(candidate: CandidateAction) -> Dict[str, Any]:
         "action_data": dict(candidate.action_data or {}),
         "score": float(candidate.score),
         "source": candidate.source,
+        "metadata": dict(candidate.metadata or {}),
     }
 
 
@@ -150,17 +154,18 @@ def replay_sequence(
             action_data=dict(action_spec.get("action_data") or {}),
             score=float(action_spec.get("score", 0.0)),
             source=str(action_spec.get("source", "beam")),
+            metadata=dict(action_spec.get("metadata") or {}),
         )
         next_obs = env.step(GameAction.from_id(candidate.action_id), data=candidate.action_data or {})
         if next_obs is None:
             break
         next_frame = final_subframe(next_obs.frame)
-        delta_pixels = sum(
-            1
-            for y in range(len(previous_frame))
-            for x in range(len(previous_frame[y]))
-            if int(previous_frame[y][x]) != int(next_frame[y][x])
+        event_frame, event_frame_index, event_delta_pixels = informative_subframe(
+            next_obs.frame,
+            reference_frame=previous_frame,
         )
+        stable_delta_pixels = frame_delta(previous_frame, next_frame)
+        delta_pixels = max(stable_delta_pixels, event_delta_pixels)
         progress_gain = max(0, int(next_obs.levels_completed) - int(raw_obs.levels_completed))
         novelty = agent.update_memory(
             action=candidate,
@@ -168,14 +173,28 @@ def replay_sequence(
             next_frame=next_frame,
             levels_before=int(raw_obs.levels_completed),
             levels_after=int(next_obs.levels_completed),
+            observed_delta=delta_pixels,
         )
+        action_metadata = dict(candidate.metadata or {})
+        if event_delta_pixels > stable_delta_pixels:
+            action_metadata["event_frame_index"] = int(event_frame_index)
+            action_metadata["event_delta_pixels"] = int(event_delta_pixels)
         transitions.append(
             {
                 "frame": [row[:] for row in previous_frame],
                 "available_actions": list(getattr(raw_obs, "available_actions", [])),
                 "action_id": candidate.action_id,
                 "action_data": dict(candidate.action_data or {}),
+                "action_score": float(candidate.score),
+                "action_source": candidate.source,
+                "action_metadata": action_metadata,
+                "frame_visual_summary": visual_saliency_summary(previous_frame),
+                "next_frame_visual_summary": visual_saliency_summary(next_frame),
                 "next_frame": [row[:] for row in next_frame],
+                "event_frame": [row[:] for row in event_frame] if event_delta_pixels > stable_delta_pixels else None,
+                "event_frame_index": int(event_frame_index),
+                "stable_delta_pixels": stable_delta_pixels,
+                "event_delta_pixels": event_delta_pixels,
                 "levels_before": int(raw_obs.levels_completed),
                 "levels_after": int(next_obs.levels_completed),
                 "state_before": state_name,
@@ -230,6 +249,26 @@ def replay_sequence(
     no_effect_action6 = sum(
         1 for transition in transitions if int(transition["action_id"]) == 6 and int(transition["delta_pixels"]) == 0
     )
+    visual_salience_values: List[float] = []
+    effective_visual_steps = 0
+    ineffective_visual_clicks = 0
+    for transition in transitions:
+        metadata = dict(transition.get("action_metadata") or {})
+        visual_salience = float(metadata.get("visual_salience", 0.0))
+        if "point_visual" in metadata and isinstance(metadata["point_visual"], dict):
+            visual_salience = max(visual_salience, float(metadata["point_visual"].get("salience_score", 0.0)))
+        if visual_salience <= 0.0:
+            continue
+        visual_salience_values.append(visual_salience)
+        if int(transition.get("delta_pixels", 0)) > 0 or int(transition.get("levels_after", 0)) > int(transition.get("levels_before", 0)):
+            effective_visual_steps += 1
+        elif int(transition.get("action_id", 0)) == 6:
+            ineffective_visual_clicks += 1
+    avg_visual_salience = (
+        float(sum(visual_salience_values)) / float(len(visual_salience_values))
+        if visual_salience_values
+        else 0.0
+    )
     last_coord: Optional[tuple[int, int]] = None
     for transition in transitions:
         if int(transition["action_id"]) != 6:
@@ -270,6 +309,9 @@ def replay_sequence(
         "zero_delta_steps": zero_delta_steps,
         "low_delta_steps": low_delta_steps,
         "no_effect_action6": no_effect_action6,
+        "avg_visual_salience": avg_visual_salience,
+        "effective_visual_steps": effective_visual_steps,
+        "ineffective_visual_clicks": ineffective_visual_clicks,
         "repeated_templates": repeated_templates,
         "post_progress_stall": post_progress_stall,
         "transitions": transitions,
@@ -286,6 +328,7 @@ def replay_sequence(
         + min(total_delta / 64.0, 28.0)
         + (total_novelty * 3.0)
         + (unique_frames * 3.0)
+        + (avg_visual_salience * effective_visual_steps * 0.55)
         + (10.0 if state_name == "NOT_FINISHED" and len(transitions) > 0 else 0.0)
         - (50.0 if state_name == "GAME_OVER" else 0.0)
         - (reverse_pairs * 5.0)
@@ -295,6 +338,7 @@ def replay_sequence(
         - (zero_delta_steps * 1.1)
         - (low_delta_steps * 0.18)
         - (no_effect_action6 * 1.6)
+        - (ineffective_visual_clicks * 0.45)
         - (repeated_templates * 6.0)
         - (post_progress_stall * 0.45)
         - no_progress_penalty

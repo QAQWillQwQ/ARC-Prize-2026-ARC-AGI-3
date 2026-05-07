@@ -26,6 +26,7 @@ class CandidateAction:
     action_data: Optional[Dict[str, int]] = None
     score: float = 0.0
     source: str = "heuristic"
+    metadata: Optional[Dict[str, Any]] = None
 
 
 PROFILES: Dict[str, Dict[str, Any]] = {
@@ -216,6 +217,29 @@ def final_subframe(frame_stack: Sequence[Sequence[Sequence[int]]]) -> List[List[
     return [[int(value) for value in row] for row in frame]
 
 
+def informative_subframe(
+    frame_stack: Sequence[Sequence[Sequence[int]]],
+    reference_frame: Optional[Sequence[Sequence[int]]] = None,
+) -> Tuple[List[List[int]], int, int]:
+    if not frame_stack:
+        blank = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
+        return blank, 0, 0
+    if reference_frame is None:
+        return final_subframe(frame_stack), len(frame_stack) - 1, 0
+
+    best_frame = final_subframe(frame_stack)
+    best_index = len(frame_stack) - 1
+    best_delta = frame_delta(reference_frame, best_frame)
+    for index, raw_frame in enumerate(frame_stack):
+        frame = [[int(value) for value in row] for row in raw_frame]
+        delta = frame_delta(reference_frame, frame)
+        if delta > best_delta:
+            best_frame = frame
+            best_index = index
+            best_delta = delta
+    return best_frame, best_index, best_delta
+
+
 def frame_hash(frame: Sequence[Sequence[int]]) -> str:
     flat = bytes(int(value) & 0x0F for row in frame for value in row)
     return hashlib.sha1(flat).hexdigest()
@@ -304,45 +328,320 @@ def changed_points(prev_frame: Sequence[Sequence[int]], next_frame: Sequence[Seq
     return points
 
 
+def color_counts(frame: Sequence[Sequence[int]]) -> Dict[int, int]:
+    counts = {color: 0 for color in range(NUM_COLORS)}
+    for y in range(min(GRID_SIZE, len(frame))):
+        row = frame[y]
+        for x in range(min(GRID_SIZE, len(row))):
+            color = int(row[x])
+            if color < 0 or color >= NUM_COLORS:
+                color = 0
+            counts[color] += 1
+    return counts
+
+
+def ranked_colors(frame: Sequence[Sequence[int]]) -> List[Dict[str, Any]]:
+    counts = color_counts(frame)
+    total = max(1, sum(counts.values()))
+    ranked = [
+        {
+            "color": int(color),
+            "count": int(count),
+            "frequency": float(count) / float(total),
+        }
+        for color, count in counts.items()
+        if count > 0
+    ]
+    ranked.sort(key=lambda item: (int(item["count"]), int(item["color"])), reverse=True)
+    return ranked
+
+
+def visual_saliency_summary(frame: Sequence[Sequence[int]]) -> Dict[str, Any]:
+    counts = color_counts(frame)
+    total = max(1, sum(counts.values()))
+    ranked = ranked_colors(frame)
+    entropy = 0.0
+    for count in counts.values():
+        if count <= 0:
+            continue
+        probability = float(count) / float(total)
+        entropy -= probability * math.log(probability + 1e-12)
+    entropy /= math.log(float(NUM_COLORS))
+
+    dominant_color = int(ranked[0]["color"]) if ranked else 0
+    dominant_count = int(ranked[0]["count"]) if ranked else 0
+    rare_threshold = max(1, int(total * 0.025))
+    rare_colors = [
+        int(color)
+        for color, count in counts.items()
+        if count > 0 and count <= rare_threshold
+    ]
+    return {
+        "dominant_color": dominant_color,
+        "dominant_frequency": float(dominant_count) / float(total),
+        "num_colors": len(ranked),
+        "color_entropy": entropy,
+        "rare_color_count": len(rare_colors),
+        "rare_colors": rare_colors,
+        "top_colors": ranked[:6],
+    }
+
+
+def _component_lookup(components: Sequence[Dict[str, Any]]) -> Dict[Tuple[int, int], int]:
+    lookup: Dict[Tuple[int, int], int] = {}
+    for index, component in enumerate(components):
+        for point in component.get("cells", []):
+            lookup[(int(point[0]), int(point[1]))] = index
+    return lookup
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _round_float(value: float) -> float:
+    return round(float(value), 6)
+
+
+def point_visual_features(
+    frame: Sequence[Sequence[int]],
+    point: Tuple[int, int],
+    prev_frame: Optional[Sequence[Sequence[int]]] = None,
+    components: Optional[Sequence[Dict[str, Any]]] = None,
+    component_lookup: Optional[Dict[Tuple[int, int], int]] = None,
+    counts: Optional[Dict[int, int]] = None,
+    changed_lookup: Optional[set[Tuple[int, int]]] = None,
+) -> Dict[str, Any]:
+    x = max(0, min(GRID_SIZE - 1, int(point[0])))
+    y = max(0, min(GRID_SIZE - 1, int(point[1])))
+    color = int(frame[y][x])
+    if color < 0 or color >= NUM_COLORS:
+        color = 0
+
+    counts = dict(counts or color_counts(frame))
+    total = max(1, sum(counts.values()))
+    color_count = int(counts.get(color, 0))
+    color_frequency = float(color_count) / float(total)
+    color_rarity = 1.0 - math.sqrt(max(0.0, min(1.0, color_frequency)))
+
+    ranked = sorted(counts.items(), key=lambda item: (item[1], item[0]), reverse=True)
+    dominant_color = int(ranked[0][0]) if ranked else 0
+    dominant_frequency = float(ranked[0][1]) / float(total) if ranked else 0.0
+    non_dominant = int(color != dominant_color)
+
+    neighbor_total = 0
+    different_neighbors = 0
+    neighbor_colors = set()
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            nx = x + dx
+            ny = y + dy
+            if nx < 0 or ny < 0 or nx >= GRID_SIZE or ny >= GRID_SIZE:
+                continue
+            neighbor_total += 1
+            neighbor_color = int(frame[ny][nx])
+            if neighbor_color < 0 or neighbor_color >= NUM_COLORS:
+                neighbor_color = 0
+            neighbor_colors.add(neighbor_color)
+            different_neighbors += int(neighbor_color != color)
+    local_contrast = float(different_neighbors) / float(max(1, neighbor_total))
+    neighbor_color_diversity = float(len(neighbor_colors)) / float(max(1, NUM_COLORS))
+
+    components = list(components or connected_components(frame))
+    component_lookup = dict(component_lookup or _component_lookup(components))
+    component_index = component_lookup.get((x, y), -1)
+    component_area = 0
+    component_center = (x, y)
+    component_bbox = (x, y, x, y)
+    component_width = 1
+    component_height = 1
+    bbox_area = 1
+    edge_cell = 0
+    component_fill = 1.0
+    if component_index >= 0 and component_index < len(components):
+        component = components[component_index]
+        component_area = int(component.get("area", 0))
+        component_center = tuple(component.get("center", (x, y)))  # type: ignore[assignment]
+        component_bbox = tuple(component.get("bbox", (x, y, x, y)))  # type: ignore[assignment]
+        x0, y0, x1, y1 = (int(value) for value in component_bbox)
+        component_width = max(1, x1 - x0 + 1)
+        component_height = max(1, y1 - y0 + 1)
+        bbox_area = max(1, component_width * component_height)
+        component_fill = float(component_area) / float(bbox_area)
+        edge_cell = int(x in (x0, x1) or y in (y0, y1))
+    component_area_ratio = float(component_area) / float(total)
+    component_rarity = 1.0 - math.sqrt(max(0.0, min(1.0, component_area_ratio)))
+    elongation = abs(component_width - component_height) / float(max(component_width, component_height, 1))
+    shape_signal = _clamp01((edge_cell * 0.45) + (1.0 - component_fill) * 0.35 + elongation * 0.2)
+
+    if changed_lookup is None and prev_frame is not None:
+        changed_lookup = set(changed_points(prev_frame, frame))
+    changed_lookup = changed_lookup or set()
+    changed_here = int((x, y) in changed_lookup)
+    changed_nearby = 0
+    for ny in range(max(0, y - 2), min(GRID_SIZE, y + 3)):
+        for nx in range(max(0, x - 2), min(GRID_SIZE, x + 3)):
+            changed_nearby += int((nx, ny) in changed_lookup)
+    changed_nearby_ratio = float(changed_nearby) / 25.0
+
+    salience = (
+        color_rarity * 0.38
+        + local_contrast * 0.22
+        + component_rarity * 0.20
+        + shape_signal * 0.10
+        + changed_nearby_ratio * 0.16
+        + neighbor_color_diversity * 0.08
+        + non_dominant * 0.06
+    )
+    if color == dominant_color and dominant_frequency >= 0.35 and component_area_ratio >= 0.12:
+        salience -= 0.18
+    if component_area == 0:
+        salience *= 0.7
+    salience = _clamp01(salience)
+
+    return {
+        "x": x,
+        "y": y,
+        "color": color,
+        "color_count": color_count,
+        "color_frequency": _round_float(color_frequency),
+        "color_rarity": _round_float(color_rarity),
+        "dominant_color": dominant_color,
+        "dominant_frequency": _round_float(dominant_frequency),
+        "non_dominant": non_dominant,
+        "local_contrast": _round_float(local_contrast),
+        "neighbor_color_diversity": _round_float(neighbor_color_diversity),
+        "component_index": int(component_index),
+        "component_area": int(component_area),
+        "component_area_ratio": _round_float(component_area_ratio),
+        "component_rarity": _round_float(component_rarity),
+        "component_center": [int(component_center[0]), int(component_center[1])],
+        "component_bbox": [int(value) for value in component_bbox],
+        "component_width": int(component_width),
+        "component_height": int(component_height),
+        "component_fill": _round_float(component_fill),
+        "component_elongation": _round_float(elongation),
+        "component_edge_cell": edge_cell,
+        "shape_signal": _round_float(shape_signal),
+        "changed_here": changed_here,
+        "changed_nearby_ratio": _round_float(changed_nearby_ratio),
+        "salience_score": _round_float(salience),
+    }
+
+
+def salient_point_features(
+    frame: Sequence[Sequence[int]],
+    prev_frame: Optional[Sequence[Sequence[int]]] = None,
+    budget: int = 20,
+) -> List[Dict[str, Any]]:
+    budget = max(1, int(budget))
+    counts = color_counts(frame)
+    total = max(1, sum(counts.values()))
+    components = connected_components(frame)
+    lookup = _component_lookup(components)
+    changed_lookup = set(changed_points(prev_frame, frame)) if prev_frame is not None else set()
+    by_point: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    def add(point: Tuple[int, int], source: str, source_bonus: float = 0.0) -> None:
+        x = max(0, min(GRID_SIZE - 1, int(point[0])))
+        y = max(0, min(GRID_SIZE - 1, int(point[1])))
+        feature = point_visual_features(
+            frame=frame,
+            point=(x, y),
+            prev_frame=prev_frame,
+            components=components,
+            component_lookup=lookup,
+            counts=counts,
+            changed_lookup=changed_lookup,
+        )
+        adjusted = _clamp01(float(feature["salience_score"]) + float(source_bonus))
+        feature["salience_score"] = _round_float(adjusted)
+        feature["source"] = source
+        existing = by_point.get((x, y))
+        if existing is None or float(feature["salience_score"]) > float(existing["salience_score"]):
+            by_point[(x, y)] = feature
+
+    ranked_component_points: List[Tuple[float, Dict[str, Any]]] = []
+    for component in components:
+        area = int(component.get("area", 0))
+        color = int(component.get("color", 0))
+        color_frequency = float(counts.get(color, 0)) / float(total)
+        area_ratio = float(area) / float(total)
+        component_signal = (
+            (1.0 - math.sqrt(max(0.0, min(1.0, color_frequency)))) * 0.45
+            + (1.0 - math.sqrt(max(0.0, min(1.0, area_ratio)))) * 0.35
+        )
+        if area_ratio >= 0.25:
+            component_signal -= 0.25
+        ranked_component_points.append((component_signal, component))
+    ranked_component_points.sort(key=lambda item: item[0], reverse=True)
+
+    component_limit = max(budget * 2, 12)
+    for signal, component in ranked_component_points[:component_limit]:
+        center = tuple(component["center"])
+        x0, y0, x1, y1 = (int(value) for value in component["bbox"])
+        points = [
+            center,
+            (x0, y0),
+            (x1, y0),
+            (x0, y1),
+            (x1, y1),
+            ((x0 + x1) // 2, y0),
+            ((x0 + x1) // 2, y1),
+            (x0, (y0 + y1) // 2),
+            (x1, (y0 + y1) // 2),
+        ]
+        bonus = max(0.0, min(0.08, signal * 0.05))
+        for point in points:
+            add(point, source="component", source_bonus=bonus)
+
+    if changed_lookup:
+        delta_points = sorted(changed_lookup)
+        stride = max(1, len(delta_points) // max(1, budget))
+        for point in delta_points[::stride]:
+            add(point, source="changed", source_bonus=0.10)
+
+    rare_color_threshold = max(1, int(total * 0.025))
+    rare_colors = {
+        int(color)
+        for color, count in counts.items()
+        if count > 0 and count <= rare_color_threshold
+    }
+    for component in components:
+        if int(component.get("color", 0)) not in rare_colors:
+            continue
+        add(tuple(component["center"]), source="rare_color", source_bonus=0.08)
+
+    for point in _grid_points(step=16):
+        add(point, source="grid", source_bonus=-0.12)
+    for point in _grid_points(step=32):
+        add(point, source="grid", source_bonus=-0.10)
+    add((GRID_SIZE // 2, GRID_SIZE // 2), source="grid", source_bonus=-0.08)
+
+    ranked = sorted(
+        by_point.values(),
+        key=lambda item: (
+            float(item["salience_score"]),
+            float(item["color_rarity"]),
+            float(item["local_contrast"]),
+            -float(item["component_area_ratio"]),
+        ),
+        reverse=True,
+    )
+    return ranked[:budget]
+
+
 def salient_points(
     frame: Sequence[Sequence[int]],
     prev_frame: Optional[Sequence[Sequence[int]]] = None,
     budget: int = 20,
 ) -> List[Tuple[int, int]]:
-    candidates: List[Tuple[int, int]] = []
-    seen = set()
-
-    def add(point: Tuple[int, int]) -> None:
-        x, y = point
-        x = max(0, min(GRID_SIZE - 1, int(x)))
-        y = max(0, min(GRID_SIZE - 1, int(y)))
-        key = (x, y)
-        if key not in seen:
-            seen.add(key)
-            candidates.append(key)
-
-    for component in connected_components(frame)[: max(1, budget // 2)]:
-        add(component["center"])
-        x0, y0, x1, y1 = component["bbox"]
-        add((x0, y0))
-        add((x1, y0))
-        add((x0, y1))
-        add((x1, y1))
-
-    if prev_frame is not None:
-        delta_points = changed_points(prev_frame, frame)
-        if delta_points:
-            stride = max(1, len(delta_points) // max(1, budget // 3))
-            for point in delta_points[::stride]:
-                add(point)
-
-    for point in _grid_points(step=16):
-        add(point)
-    for point in _grid_points(step=32):
-        add(point)
-    add((GRID_SIZE // 2, GRID_SIZE // 2))
-
-    return candidates[:budget]
+    return [
+        (int(feature["x"]), int(feature["y"]))
+        for feature in salient_point_features(frame=frame, prev_frame=prev_frame, budget=budget)
+    ]
 
 
 def one_hot_frames(history: Sequence[Sequence[Sequence[int]]]) -> torch.Tensor:
@@ -473,7 +772,12 @@ def transition_reward(transition: Dict[str, Any]) -> float:
     delta = float(transition.get("delta_pixels", 0))
     novelty = float(transition.get("novelty", 0.0))
     won = 1.0 if transition.get("state_after") == "WIN" else 0.0
-    reward = (3.0 * progress) + min(delta / 128.0, 1.0) * 0.1 + novelty * 0.25 + won * 2.0 - 0.01
+    metadata = dict(transition.get("action_metadata") or transition.get("candidate_metadata") or {})
+    visual_salience = float(metadata.get("visual_salience", 0.0))
+    if "point_visual" in metadata and isinstance(metadata["point_visual"], dict):
+        visual_salience = max(visual_salience, float(metadata["point_visual"].get("salience_score", 0.0)))
+    visual_term = min(max(visual_salience, 0.0), 1.0) * (0.06 if delta > 0 or progress > 0 else -0.02)
+    reward = (3.0 * progress) + min(delta / 128.0, 1.0) * 0.1 + novelty * 0.25 + won * 2.0 + visual_term - 0.01
     return reward
 
 

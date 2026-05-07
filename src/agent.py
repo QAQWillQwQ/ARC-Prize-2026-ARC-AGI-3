@@ -12,18 +12,28 @@ from .common import (
     ACTION_IDS,
     ACTION_TO_INDEX,
     CandidateAction,
+    changed_points,
     final_subframe,
     frame_delta,
     frame_hash,
+    informative_subframe,
     novelty_bonus,
     one_hot_frames,
     pad_history,
-    salient_points,
+    point_visual_features,
+    salient_point_features,
     scalar_features,
+    visual_saliency_summary,
 )
 from .model import build_model, load_checkpoint
 
 OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
+MOVE_ACTION_VECTORS: Dict[int, Tuple[int, int]] = {
+    1: (0, -1),
+    2: (0, 1),
+    3: (-1, 0),
+    4: (1, 0),
+}
 
 
 @dataclass
@@ -113,7 +123,9 @@ class PolicyGuidedAgent:
         self.recent_signatures: Deque[str] = deque(maxlen=16)
         self.action_history: Deque[int] = deque(maxlen=12)
         self.coord_history: Deque[Tuple[int, int]] = deque(maxlen=12)
+        self.motion_history: Deque[Tuple[float, float]] = deque(maxlen=12)
         self.delta_history: Deque[int] = deque(maxlen=12)
+        self.motion_centroid: Optional[Tuple[float, float]] = None
         self.action_effect: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points: Dict[Tuple[int, int], int] = {}
@@ -147,7 +159,9 @@ class PolicyGuidedAgent:
         self.recent_signatures = deque([self.seen_signatures[0]], maxlen=16)
         self.action_history = deque(maxlen=12)
         self.coord_history = deque(maxlen=12)
+        self.motion_history = deque(maxlen=12)
         self.delta_history = deque(maxlen=12)
+        self.motion_centroid = None
         self.action_effect = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points = {}
@@ -237,6 +251,97 @@ class PolicyGuidedAgent:
         distance = abs(last_x - point[0]) + abs(last_y - point[1])
         return min(distance / 48.0, 0.35)
 
+    @staticmethod
+    def _centroid(points: Sequence[Tuple[int, int]]) -> Optional[Tuple[float, float]]:
+        if not points:
+            return None
+        return (
+            float(sum(point[0] for point in points)) / float(len(points)),
+            float(sum(point[1] for point in points)) / float(len(points)),
+        )
+
+    def _update_motion_memory(
+        self,
+        action_id: int,
+        previous_frame: Sequence[Sequence[int]],
+        next_frame: Sequence[Sequence[int]],
+    ) -> None:
+        if action_id not in MOVE_ACTION_VECTORS:
+            return
+        points = changed_points(previous_frame, next_frame)
+        if not points or len(points) > 768:
+            return
+        centroid = self._centroid(points)
+        if centroid is None:
+            return
+        self.motion_centroid = centroid
+        self.motion_history.append(centroid)
+
+    def _movement_goal_signal(
+        self,
+        action_id: int,
+        frame: Sequence[Sequence[int]],
+        prev_frame: Optional[Sequence[Sequence[int]]],
+    ) -> Tuple[float, Dict[str, Any]]:
+        if action_id not in MOVE_ACTION_VECTORS or self.motion_centroid is None:
+            return 0.0, {}
+
+        cx, cy = self.motion_centroid
+        target_features = salient_point_features(
+            frame=frame,
+            prev_frame=prev_frame,
+            budget=max(8, min(16, self.coord_budget)),
+        )
+        best_target: Optional[Dict[str, Any]] = None
+        best_target_score = -1e9
+        for feature in target_features:
+            x = float(feature["x"])
+            y = float(feature["y"])
+            distance = abs(x - cx) + abs(y - cy)
+            if distance < 4.0:
+                continue
+            point = (int(x), int(y))
+            recent_penalty = 0.0
+            for previous in self.coord_history:
+                if abs(previous[0] - point[0]) + abs(previous[1] - point[1]) <= 2:
+                    recent_penalty += 0.08
+            salience = float(feature.get("salience_score", 0.0))
+            target_score = salience + min(distance / 64.0, 0.35) - recent_penalty
+            if target_score > best_target_score:
+                best_target_score = target_score
+                best_target = feature
+
+        if best_target is None:
+            return 0.0, {}
+
+        goal_x = float(best_target["x"])
+        goal_y = float(best_target["y"])
+        dx = goal_x - cx
+        dy = goal_y - cy
+        norm = max(abs(dx) + abs(dy), 1.0)
+        vx, vy = MOVE_ACTION_VECTORS[action_id]
+        alignment = ((float(vx) * dx) + (float(vy) * dy)) / norm
+        salience = float(best_target.get("salience_score", 0.0))
+        if alignment <= 0.0:
+            bonus = max(-0.18, alignment * 0.16)
+        else:
+            bonus = min(0.65, alignment * (0.22 + salience * 0.58))
+            if self.steps_since_progress >= max(4, self.stall_steps // 4):
+                bonus *= 1.2
+        metadata = {
+            "movement_goal": {
+                "x": int(goal_x),
+                "y": int(goal_y),
+                "salience_score": float(best_target.get("salience_score", 0.0)),
+                "color": int(best_target.get("color", 0)),
+                "source": str(best_target.get("source", "")),
+            },
+            "motion_centroid": [round(cx, 3), round(cy, 3)],
+            "movement_alignment": round(float(alignment), 6),
+            "movement_goal_bonus": round(float(bonus), 6),
+        }
+        return float(bonus), metadata
+
     def _policy_output(
         self,
         available_actions: Sequence[int],
@@ -265,27 +370,42 @@ class PolicyGuidedAgent:
         output = self._policy_output(available_actions, levels_completed, step_index)
         candidates: List[CandidateAction] = []
         available_set = set(int(action) for action in available_actions)
+        movement_available = any(action_id in available_set for action_id in MOVE_ACTION_VECTORS)
 
         for action_id in ACTION_IDS:
             if action_id not in available_set:
                 continue
             if action_id == 6:
-                coord_points: List[Tuple[int, int]] = []
+                coord_features: List[Dict[str, Any]] = []
                 seen_points = set()
                 for point in self.coord_hint_points:
                     if point not in seen_points:
                         seen_points.add(point)
-                        coord_points.append(point)
-                for point in salient_points(frame, prev_frame=prev_frame, budget=self.coord_budget):
+                        feature = point_visual_features(frame=frame, point=point, prev_frame=prev_frame)
+                        feature["source"] = "probe_hint"
+                        feature["salience_score"] = min(1.0, float(feature["salience_score"]) + 0.06)
+                        coord_features.append(feature)
+                for feature in salient_point_features(frame, prev_frame=prev_frame, budget=self.coord_budget):
+                    point = (int(feature["x"]), int(feature["y"]))
                     if point not in seen_points:
                         seen_points.add(point)
-                        coord_points.append(point)
+                        coord_features.append(feature)
                 if output is None:
-                    hinted = [point for point in coord_points if point in self.coord_hint_set]
-                    fallback = [point for point in coord_points if point not in self.coord_hint_set]
-                    self.rng.shuffle(fallback)
-                    coord_points = hinted + fallback
-                for x, y in coord_points:
+                    hinted = [feature for feature in coord_features if (int(feature["x"]), int(feature["y"])) in self.coord_hint_set]
+                    fallback = [feature for feature in coord_features if (int(feature["x"]), int(feature["y"])) not in self.coord_hint_set]
+                    fallback.sort(
+                        key=lambda feature: (
+                            float(feature.get("salience_score", 0.0)),
+                            float(feature.get("color_rarity", 0.0)),
+                            self.rng.random() * 0.001,
+                        ),
+                        reverse=True,
+                    )
+                    coord_features = hinted + fallback
+                for feature in coord_features:
+                    x = int(feature["x"])
+                    y = int(feature["y"])
+                    visual_salience = float(feature.get("salience_score", 0.0))
                     score = 0.0
                     if output is not None:
                         score += output.action_scores[ACTION_TO_INDEX[action_id]]
@@ -293,8 +413,19 @@ class PolicyGuidedAgent:
                     score += self.action_prior_scores.get(action_id, 0.0) * 0.25
                     score += self.action_effect[action_id] * 0.2
                     score += self.action_success[action_id] * 0.4
+                    visual_weight = 0.85 if output is None else 0.45
+                    if movement_available:
+                        visual_weight = 0.35 if output is None else 0.24
+                        if self.action_prior_scores.get(action_id, 0.0) > 0.0 or self.action_effect[action_id] > 0.05:
+                            visual_weight += 0.22
+                        if self.motion_centroid is None and len(self.action_history) < 4:
+                            visual_weight *= 0.55
+                    score += visual_salience * visual_weight
+                    score += float(feature.get("color_rarity", 0.0)) * 0.12
+                    score += float(feature.get("local_contrast", 0.0)) * 0.08
+                    score += float(feature.get("changed_nearby_ratio", 0.0)) * 0.16
                     score += 0.1 / float(1 + self.tried_points.get((x, y), 0))
-                    score += 0.02 if int(frame[y][x]) != 0 else 0.0
+                    score += 0.02 if int(feature.get("non_dominant", 0)) else 0.0
                     if (x, y) in self.coord_hint_set:
                         score += 0.45
                     if action_id in self.risky_actions:
@@ -310,15 +441,33 @@ class PolicyGuidedAgent:
                             action_data={"x": int(x), "y": int(y)},
                             score=score,
                             source="policy+coord" if output is not None else "coord",
+                            metadata={
+                                "visual_salience": visual_salience,
+                                "point_visual": dict(feature),
+                                "selection_mode": "visual_saliency_coord",
+                                "visual_weight": round(float(visual_weight), 6),
+                            },
                         )
                     )
             else:
                 score = 0.0
+                metadata: Dict[str, Any] = {}
                 if output is not None:
                     score += output.action_scores[ACTION_TO_INDEX[action_id]]
                 score += self.action_prior_scores.get(action_id, 0.0) * 0.25
                 score += self.action_effect[action_id] * 0.2
                 score += self.action_success[action_id] * 0.4
+                if action_id in MOVE_ACTION_VECTORS and self.motion_centroid is None and len(self.action_history) < 4:
+                    calibration_bonus = 0.22 - (0.03 * len(self.action_history))
+                    score += calibration_bonus
+                    metadata["movement_calibration_bonus"] = round(float(calibration_bonus), 6)
+                movement_bonus, movement_metadata = self._movement_goal_signal(
+                    action_id=action_id,
+                    frame=frame,
+                    prev_frame=prev_frame,
+                )
+                score += movement_bonus
+                metadata.update(movement_metadata)
                 if action_id in self.risky_actions:
                     score -= 0.5
                 if self.last_action_id == action_id and self.steps_since_progress > 2:
@@ -332,6 +481,7 @@ class PolicyGuidedAgent:
                         action_data=None,
                         score=score,
                         source="policy" if output is not None else "heuristic",
+                        metadata=metadata or None,
                     )
                 )
 
@@ -365,8 +515,11 @@ class PolicyGuidedAgent:
         next_frame: Sequence[Sequence[int]],
         levels_before: int,
         levels_after: int,
+        observed_delta: Optional[int] = None,
     ) -> float:
         delta = frame_delta(previous_frame, next_frame)
+        if observed_delta is not None:
+            delta = max(delta, int(observed_delta))
         signature = frame_hash(next_frame)
         novelty = novelty_bonus(signature, self.seen_signatures)
         repeated_recent = int(signature in self.recent_signatures)
@@ -409,7 +562,14 @@ class PolicyGuidedAgent:
         if action.action_id == 6 and action.action_data is not None:
             point = (int(action.action_data["x"]), int(action.action_data["y"]))
             utility -= self._coord_repeat_penalty(point) * 0.35
+            metadata = dict(action.metadata or {})
+            visual_salience = float(metadata.get("visual_salience", 0.0))
+            if delta > 0 or progress_gain > 0:
+                utility += min(max(visual_salience, 0.0), 1.0) * 0.12
+            elif visual_salience > 0.5:
+                utility -= min(visual_salience * 0.08, 0.08)
             self.coord_history.append(point)
+        self._update_motion_memory(action.action_id, previous_frame, next_frame)
         self.action_effect[action.action_id] = (self.action_effect[action.action_id] * 0.7) + utility * 0.3
         if levels_after > levels_before:
             self.action_success[action.action_id] = (self.action_success[action.action_id] * 0.5) + 0.5
@@ -495,25 +655,45 @@ class PolicyGuidedAgent:
                 break
 
             next_frame = final_subframe(next_obs.frame)
+            event_frame, event_frame_index, event_delta_pixels = informative_subframe(
+                next_obs.frame,
+                reference_frame=frame,
+            )
+            stable_delta_pixels = frame_delta(frame, next_frame)
+            delta_pixels = max(stable_delta_pixels, event_delta_pixels)
             novelty = self.update_memory(
                 action=action,
-                previous_frame=self.history_frames[-2] if len(self.history_frames) > 1 else frame,
+                previous_frame=frame,
                 next_frame=next_frame,
                 levels_before=int(raw_obs.levels_completed),
                 levels_after=int(next_obs.levels_completed),
+                observed_delta=delta_pixels,
             )
+            action_metadata = dict(action.metadata or {})
+            if event_delta_pixels > stable_delta_pixels:
+                action_metadata["event_frame_index"] = int(event_frame_index)
+                action_metadata["event_delta_pixels"] = int(event_delta_pixels)
             transitions.append(
                 {
                     "frame": [row[:] for row in frame],
                     "available_actions": list(getattr(raw_obs, "available_actions", [])),
                     "action_id": action.action_id,
                     "action_data": dict(action.action_data or {}),
+                    "action_score": float(action.score),
+                    "action_source": action.source,
+                    "action_metadata": action_metadata,
+                    "frame_visual_summary": visual_saliency_summary(frame),
+                    "next_frame_visual_summary": visual_saliency_summary(next_frame),
                     "next_frame": [row[:] for row in next_frame],
+                    "event_frame": [row[:] for row in event_frame] if event_delta_pixels > stable_delta_pixels else None,
+                    "event_frame_index": int(event_frame_index),
+                    "stable_delta_pixels": stable_delta_pixels,
+                    "event_delta_pixels": event_delta_pixels,
                     "levels_before": int(raw_obs.levels_completed),
                     "levels_after": int(next_obs.levels_completed),
                     "state_before": state_name,
                     "state_after": next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state),
-                    "delta_pixels": frame_delta(frame, next_frame),
+                    "delta_pixels": delta_pixels,
                     "novelty": novelty,
                     "step_index": step_index,
                 }

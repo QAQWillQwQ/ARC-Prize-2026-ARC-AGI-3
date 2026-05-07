@@ -276,17 +276,18 @@ def render_transition_panel(
     prior_centroids: Sequence[Tuple[float, float]],
 ) -> Image.Image:
     before = render_grid(transition["frame"], cell_size)
-    after = render_grid(transition["next_frame"], cell_size)
-    diff = render_diff_overlay(transition["next_frame"], transition["frame"], cell_size)
+    event_frame = transition.get("event_frame") or transition["next_frame"]
+    after = render_grid(event_frame, cell_size)
+    diff = render_diff_overlay(event_frame, transition["frame"], cell_size)
     motion = render_motion_overlay(
-        transition["next_frame"],
+        event_frame,
         transition["frame"],
         cell_size,
         prior_centroids=prior_centroids,
     )
 
     before = panel_with_caption(before, "1. BEFORE\nframe at current step")
-    after = panel_with_caption(after, "2. AFTER\nnext frame after chosen action")
+    after = panel_with_caption(after, "2. EVENT/AFTER\nmost changed subframe when available")
     diff = panel_with_caption(diff, "3. CHANGED CELLS\nwhite boxes = pixels that changed")
     motion = panel_with_caption(motion, "4. INFERRED MOTION\nbright purple = estimated moving region/path")
 
@@ -303,14 +304,19 @@ def render_transition_panel(
     )
 
     draw = ImageDraw.Draw(panel)
+    action_metadata = dict(transition.get("action_metadata") or {})
+    point_visual = dict(action_metadata.get("point_visual") or {})
+    visual_salience = float(action_metadata.get("visual_salience", point_visual.get("salience_score", 0.0) or 0.0))
     meta = (
-        "step=%d action=%d data=%s delta=%d novelty=%.3f levels %d->%d state %s->%s"
+        "step=%d action=%d data=%s delta=%d event_delta=%d novelty=%.3f visual=%.3f levels %d->%d state %s->%s"
         % (
             int(transition.get("step_index", 0)),
             int(transition.get("action_id", 0)),
             json.dumps(transition.get("action_data", {}), ensure_ascii=True, separators=(",", ":")),
             int(transition.get("delta_pixels", 0)),
+            int(transition.get("event_delta_pixels", transition.get("delta_pixels", 0))),
             float(transition.get("novelty", 0.0)),
+            visual_salience,
             int(transition.get("levels_before", 0)),
             int(transition.get("levels_after", 0)),
             str(transition.get("state_before", "")),
@@ -402,19 +408,40 @@ def write_trace_csv(output_dir: Path, episode: Dict[str, Any], trace_name: str) 
     for transition in transitions:
         before_frame = transition["frame"]
         after_frame = transition["next_frame"]
-        points = changed_points(before_frame, after_frame)
+        event_frame = transition.get("event_frame") or after_frame
+        points = changed_points(before_frame, event_frame)
         centroid = infer_motion_centroid(points)
         before_signature = frame_signature(before_frame)
         after_signature = frame_signature(after_frame)
         seen_after_count = seen_after.get(after_signature, 0)
         seen_after[after_signature] = seen_after_count + 1
+        action_metadata = dict(transition.get("action_metadata") or {})
+        point_visual = dict(action_metadata.get("point_visual") or {})
+        movement_goal = dict(action_metadata.get("movement_goal") or {})
+        visual_salience = float(action_metadata.get("visual_salience", point_visual.get("salience_score", 0.0) or 0.0))
         rows.append(
             {
                 "step_index": int(transition.get("step_index", 0)),
                 "action_id": int(transition.get("action_id", 0)),
                 "action_data": json.dumps(transition.get("action_data", {}), ensure_ascii=True, separators=(",", ":")),
+                "action_score": float(transition.get("action_score", 0.0)),
+                "action_source": str(transition.get("action_source", "")),
                 "delta_pixels": int(transition.get("delta_pixels", 0)),
+                "stable_delta_pixels": int(transition.get("stable_delta_pixels", transition.get("delta_pixels", 0))),
+                "event_delta_pixels": int(transition.get("event_delta_pixels", transition.get("delta_pixels", 0))),
+                "event_frame_index": int(transition.get("event_frame_index", -1)),
                 "novelty": float(transition.get("novelty", 0.0)),
+                "visual_salience": visual_salience,
+                "visual_color": point_visual.get("color", ""),
+                "visual_color_rarity": point_visual.get("color_rarity", ""),
+                "visual_local_contrast": point_visual.get("local_contrast", ""),
+                "visual_component_area": point_visual.get("component_area", ""),
+                "visual_component_rarity": point_visual.get("component_rarity", ""),
+                "visual_source": point_visual.get("source", ""),
+                "movement_goal_x": movement_goal.get("x", ""),
+                "movement_goal_y": movement_goal.get("y", ""),
+                "movement_goal_salience": movement_goal.get("salience_score", ""),
+                "movement_alignment": action_metadata.get("movement_alignment", ""),
                 "levels_before": int(transition.get("levels_before", 0)),
                 "levels_after": int(transition.get("levels_after", 0)),
                 "state_before": str(transition.get("state_before", "")),
@@ -434,8 +461,24 @@ def write_trace_csv(output_dir: Path, episode: Dict[str, Any], trace_name: str) 
         "step_index",
         "action_id",
         "action_data",
+        "action_score",
+        "action_source",
         "delta_pixels",
+        "stable_delta_pixels",
+        "event_delta_pixels",
+        "event_frame_index",
         "novelty",
+        "visual_salience",
+        "visual_color",
+        "visual_color_rarity",
+        "visual_local_contrast",
+        "visual_component_area",
+        "visual_component_rarity",
+        "visual_source",
+        "movement_goal_x",
+        "movement_goal_y",
+        "movement_goal_salience",
+        "movement_alignment",
         "levels_before",
         "levels_after",
         "state_before",
@@ -498,7 +541,8 @@ def save_episode_visuals(
             panel.save(frame_path)
             frame_paths.append(frame_path)
         frames.append(panel)
-        centroid = infer_motion_centroid(changed_points(transition["frame"], transition["next_frame"]))
+        event_frame = transition.get("event_frame") or transition["next_frame"]
+        centroid = infer_motion_centroid(changed_points(transition["frame"], event_frame))
         if centroid is not None:
             centroids.append(centroid)
 

@@ -16,6 +16,7 @@ from .common import (
     append_jsonl_gz,
     final_subframe,
     frame_delta,
+    informative_subframe,
     load_metadata_map,
     merge_config,
     salient_points,
@@ -126,9 +127,12 @@ def probe_transition_score(
     state_name: str,
     levels_before: int,
     levels_after: int,
+    observed_delta: Optional[int] = None,
 ) -> Tuple[float, int]:
     level_gain = max(0, int(levels_after) - int(levels_before))
     delta_pixels = frame_delta(previous_frame, next_frame)
+    if observed_delta is not None:
+        delta_pixels = max(delta_pixels, int(observed_delta))
     score = (level_gain * 18.0) + min(delta_pixels / 20.0, 6.0)
     if delta_pixels > 0:
         score += 0.75
@@ -183,6 +187,7 @@ def run_probe_rollout(
         if next_obs is None:
             break
         next_frame = final_subframe(next_obs.frame)
+        _, _, event_delta_pixels = informative_subframe(next_obs.frame, reference_frame=previous_frame)
         state_name = next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state)
         step_score, delta_pixels = probe_transition_score(
             previous_frame=previous_frame,
@@ -190,6 +195,7 @@ def run_probe_rollout(
             state_name=state_name,
             levels_before=int(raw_obs.levels_completed),
             levels_after=int(next_obs.levels_completed),
+            observed_delta=event_delta_pixels,
         )
         novelty = agent.update_memory(
             action=current_candidate,
@@ -197,6 +203,7 @@ def run_probe_rollout(
             next_frame=next_frame,
             levels_before=int(raw_obs.levels_completed),
             levels_after=int(next_obs.levels_completed),
+            observed_delta=delta_pixels,
         )
         step_score += (novelty - 0.5) * 0.6
         if delta_pixels <= 0:
