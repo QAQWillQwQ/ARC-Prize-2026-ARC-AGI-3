@@ -59,24 +59,40 @@ find_py312() {
 
 ts() { date +%Y%m%d_%H%M%S; }
 
-# Background-launch a python module, log to file, save pid + run metadata, print both.
+# Background-launch a python module, log into per-output-name subdir, save pid + run metadata.
+# Args: spawn <command-tag> <output-name> -- <python-args>
+#   command-tag: short identifier (collect_full, train, eval, ...)
+#   output-name: user-facing run label (mirrors Collection_Cache/Training_Output dir name)
 spawn() {
   require_venv
-  local label="$1"; shift
+  local command="$1"; shift
+  local output_name="$1"; shift
   local stamp="$(ts)"
-  local logpath="${LOG_DIR}/${label}_${stamp}.log"
-  local pidpath="${LOG_DIR}/${label}.pid"
-  local metapath="${LOG_DIR}/${label}_${stamp}.run.json"
+  local subdir="${LOG_DIR}/${output_name}"
+  mkdir -p "$subdir"
+
+  local logpath="${subdir}/${command}_${stamp}.log"
+  local pidpath="${subdir}/${command}.pid"
+  local metapath="${subdir}/${command}_${stamp}.run.json"
+  local label="${command}_${output_name}"   # for status/log lookup messages
 
   # Save run metadata so status/audit can reconstruct what was launched
-  printf '{"label":"%s","start":"%s","cmd":%s,"log":"%s","cwd":"%s"}\n' \
-    "$label" "$(date -Is)" "$(printf '%s\n' "$@" | "$PY" -c 'import json,sys; print(json.dumps([line.rstrip() for line in sys.stdin]))')" \
+  printf '{"command":"%s","output_name":"%s","start":"%s","cmd":%s,"log":"%s","cwd":"%s"}\n' \
+    "$command" "$output_name" "$(date -Is)" \
+    "$(printf '%s\n' "$@" | "$PY" -c 'import json,sys; print(json.dumps([line.rstrip() for line in sys.stdin]))')" \
     "$logpath" "$PROJECT_ROOT" > "$metapath" 2>/dev/null || true
 
   log "log: $logpath"
-  nohup "$PY" "$@" > "$logpath" 2>&1 &
+  # Full detach:
+  #   setsid:    new session, no controlling tty (so SIGHUP / parent shell exit don't kill it)
+  #   < /dev/null: no inherited stdin (parent shell doesn't get blocked on FD)
+  #   > log 2>&1: stdout + stderr to file (no inherited tty FDs)
+  #   &:         background
+  #   disown:    drop from bash job table so run.sh exits cleanly
+  setsid nohup "$PY" "$@" < /dev/null > "$logpath" 2>&1 &
   local pid=$!
   echo "$pid" > "$pidpath"
+  disown "$pid" 2>/dev/null || true
   log "pid: $pid (saved to $pidpath)"
   log "tail with: tail -f $logpath"
   log "or: bash scripts/run.sh logs ${label}"
@@ -240,7 +256,7 @@ EOF
 
   ensure_dir "${COLLECT_DIR}/${output_name}/collected"
   log "games=$games workers=$workers output_name=$output_name profile=$profile"
-  spawn "collect_quick_${output_name}" -m src.collect_staged \
+  spawn "collect_quick" "${output_name}" -m src.collect_staged \
     --project-root "$PROJECT_ROOT" \
     --output-root "${COLLECT_DIR}/${output_name}" \
     --hardware-profile "$profile" \
@@ -252,7 +268,7 @@ EOF
 
 cmd_collect_full() {
   local workers=64
-  local output_name="wm_full_v1_openlab"
+  local output_name="wm_full_v2_openlab"
   local profile="rtx4070super"
   while [ $# -gt 0 ]; do
     case "$1" in
@@ -266,7 +282,7 @@ collect-full — Step 3: full 25-game collect.
 Usage: bash scripts/run.sh collect-full [options]
 
   --workers N            ProcessPool size (default: 64 — tune for your CPU/RAM)
-  --output-name NAME     Subdir under Collection_Cache (default: wm_full_v1_openlab)
+  --output-name NAME     Subdir under Collection_Cache (default: wm_full_v2_openlab)
   --profile NAME         Hardware profile (default: rtx4070super)
 
 Output: Local_Output/Collection_Cache/<output-name>/collected/episodes.jsonl.gz
@@ -279,7 +295,7 @@ EOF
 
   ensure_dir "${COLLECT_DIR}/${output_name}/collected"
   log "workers=$workers output_name=$output_name profile=$profile"
-  spawn "collect_full_${output_name}" -m src.collect_staged \
+  spawn "collect_full" "${output_name}" -m src.collect_staged \
     --project-root "$PROJECT_ROOT" \
     --output-root "${COLLECT_DIR}/${output_name}" \
     --hardware-profile "$profile" \
@@ -406,7 +422,7 @@ EOF
 
   ensure_dir "${TRAIN_DIR}/${output_name}"
   log "data=$data output_name=$output_name profile=$profile epochs=${epochs:-default}"
-  spawn "pretrain_${output_name}" "${args[@]}"
+  spawn "pretrain" "${output_name}" "${args[@]}"
 }
 
 # ---------- command: train ----------
@@ -460,7 +476,7 @@ EOF
 
   ensure_dir "${TRAIN_DIR}/${output_name}/checkpoints"
   log "data=$data output_name=$output_name encoder=${encoder:-none} profile=$profile epochs=${epochs:-default}"
-  spawn "train_${output_name}" "${args[@]}"
+  spawn "train" "${output_name}" "${args[@]}"
 }
 
 # ---------- command: eval ----------
@@ -522,7 +538,7 @@ EOF
 
   ensure_dir "$(dirname "$output_path")"
   log "checkpoint=$checkpoint games=${games:-all} K=${k:-1} H=${h:-5} -> $output_path"
-  spawn "eval_${output_name}" "${args[@]}"
+  spawn "eval" "${output_name}" "${args[@]}"
 }
 
 # ---------- command: status ----------
@@ -534,20 +550,22 @@ cmd_status() {
   log "memory:"
   free -h 2>/dev/null | head -2 || vm_stat | head -5
   echo
-  log "saved pid files in $LOG_DIR:"
-  for pf in "$LOG_DIR"/*.pid; do
+  log "saved pid files (recursive):"
+  while IFS= read -r pf; do
     [ -f "$pf" ] || continue
     local pid="$(cat "$pf")"
-    local name="$(basename "$pf" .pid)"
+    local rel="${pf#$LOG_DIR/}"
+    local label="${rel%.pid}"      # e.g. wm_full_v2_openlab/collect_full
     if kill -0 "$pid" 2>/dev/null; then
-      printf '  %s: pid=%s ALIVE\n' "$name" "$pid"
+      printf '  %-50s pid=%s ALIVE\n' "$label" "$pid"
     else
-      printf '  %s: pid=%s dead\n' "$name" "$pid"
+      printf '  %-50s pid=%s dead\n' "$label" "$pid"
     fi
-  done
+  done < <(find "$LOG_DIR" -type f -name "*.pid" 2>/dev/null | sort)
   echo
-  log "recent logs (last 5):"
-  ls -t "$LOG_DIR"/*.log 2>/dev/null | head -5 || echo "(none)"
+  log "recent logs (last 5, across all subdirs):"
+  find "$LOG_DIR" -type f -name "*.log" -printf "%T@ %p\n" 2>/dev/null \
+    | sort -nr | head -5 | awk '{print "  " substr($0, index($0,$2))}'
 }
 
 # ---------- command: logs ----------
@@ -556,11 +574,16 @@ cmd_logs() {
   local pattern="${1:-}"
   local target
   if [ -n "$pattern" ]; then
-    target="$(ls -t "$LOG_DIR"/*"$pattern"*.log 2>/dev/null | head -1)"
+    # search across all subdirs; match pattern against relative path
+    target="$(find "$LOG_DIR" -type f -name "*.log" 2>/dev/null \
+      | grep "$pattern" \
+      | xargs -I{} stat -c "%Y {}" {} 2>/dev/null \
+      | sort -nr | head -1 | awk '{print $2}')"
   else
-    target="$(ls -t "$LOG_DIR"/*.log 2>/dev/null | head -1)"
+    target="$(find "$LOG_DIR" -type f -name "*.log" -printf "%T@ %p\n" 2>/dev/null \
+      | sort -nr | head -1 | awk '{print $2}')"
   fi
-  [ -n "$target" ] || die "no matching log found"
+  [ -n "$target" ] || die "no matching log found (searched $LOG_DIR)"
   log "tailing: $target"
   tail -f "$target"
 }

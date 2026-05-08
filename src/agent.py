@@ -134,6 +134,14 @@ class PolicyGuidedAgent:
                 continue
             self.coord_hint_points.append((int(point[0]), int(point[1])))
         self.coord_hint_set = set(self.coord_hint_points)
+        # Track 2: directed state-transition graph for novelty-based search.
+        # Maps frame_hash -> {(action_id, x, y): next_frame_hash}. Built up
+        # online during play. Used by _state_graph_novelty_bonus to bias toward
+        # unexplored (state, action) pairs. Per arxiv:2512.24156, the training-
+        # free 3rd-place ARC AGI 3 preview agent uses this pattern + BFS to
+        # untested actions to beat frontier LLMs.
+        self.state_graph: Dict[str, Dict[Tuple[int, int, int], str]] = {}
+        self._current_frame_hash: Optional[str] = None
 
     def reset_memory(self, initial_frame: Sequence[Sequence[int]]) -> None:
         self.history_frames.clear()
@@ -155,6 +163,10 @@ class PolicyGuidedAgent:
         self.tried_points = {}
         self.dead_click_run = 0
         self.dead_click_total = 0
+        # Track 2: re-anchor the current-frame hash on reset, but do NOT clear
+        # state_graph — graph edges persist across env.reset() within an
+        # episode (same physical game, useful to keep what we've learned).
+        self._current_frame_hash = frame_hash(frame)
 
     def _repeated_template_penalty(self, action_id: int) -> float:
         history = list(self.action_history)
@@ -190,15 +202,44 @@ class PolicyGuidedAgent:
             else:
                 break
         if same_tail >= 2:
-            penalty += min(0.18 * float(same_tail - 1), 0.8)
-            if action_id == 6:
-                penalty += min(0.12 * float(same_tail - 1), 0.9)
+            # Gate the same-tail penalty on whether the action is currently
+            # productive. Keyboard-only games (ls20, g50t, tr87, wa30) and the
+            # keyboard portion of keyboard_click games require repeated same-
+            # direction pressing to navigate the grid; treating that as a stuck
+            # loop is the bug that produced 0/4 keyboard-game positives in
+            # wm_full_v1_openlab. zero_delta_streak == 0 means the most recent
+            # transition produced visible change, so the agent is making progress.
+            last_was_productive = self.zero_delta_streak == 0
+            if not last_was_productive:
+                penalty += min(0.18 * float(same_tail - 1), 0.8)
+                if action_id == 6:
+                    penalty += min(0.12 * float(same_tail - 1), 0.9)
+            elif action_id == 6:
+                # ACTION6 still gets a reduced penalty even when productive —
+                # repeated clicks at the same coord rarely stay productive,
+                # while repeated movement keys often do.
+                penalty += min(0.06 * float(same_tail - 1), 0.4)
 
+        # Track 1 cont'd: gate the 3-window, 5-window, and template-repeat
+        # penalties on productivity too. With history=[3,3,3,3,3] (keyboard
+        # navigation), all three windows match trivially and add ~3.05 penalty,
+        # which previously overwhelmed the heuristic stack's positive bonuses
+        # (max ~0.6 from action_effect + action_success). We keep these terms
+        # active when the action is NOT producing change (real ping-pong loops
+        # still get caught), and apply softened versions when productive.
+        last_was_productive = self.zero_delta_streak == 0
+        template_pen = 0.0
         if len(history) >= 3 and history[-3] == history[-1] and action_id == history[-2]:
-            penalty += 0.9
+            template_pen += 0.9
         if len(history) >= 5 and history[-5] == history[-3] == history[-1] and action_id == history[-2] == history[-4]:
-            penalty += 1.1
-        penalty += self._repeated_template_penalty(action_id)
+            template_pen += 1.1
+        template_pen += self._repeated_template_penalty(action_id)
+        if last_was_productive and history and history[-1] == action_id:
+            # Pure same-action repetition while producing change. For keyboard
+            # actions, this is legitimate navigation — kill the template penalty.
+            # For ACTION6, keep ~30% (clicks at same coord rarely stay productive).
+            template_pen *= 0.0 if action_id != 6 else 0.3
+        penalty += template_pen
 
         if self.zero_delta_streak >= 2 and history[-1] == action_id:
             penalty += min(0.22 * float(self.zero_delta_streak), 1.4)
@@ -252,6 +293,51 @@ class PolicyGuidedAgent:
             penalty += 0.6
         return penalty
 
+    def _state_graph_novelty_bonus(self, action_id: int, x: int, y: int) -> float:
+        """Track 2: novelty bonus from the directed state-transition graph.
+
+        From the current frame_hash, give a strong bonus if `(action_id, x, y)`
+        has never been tried from this state (direct novelty). If all candidates
+        from this state have been tried, BFS up to depth 4 through the graph to
+        find a node that still has unexplored actions; the candidate whose first
+        edge lies on that BFS path receives a smaller, distance-discounted bonus.
+
+        Inspired by the training-free 3rd-place ARC AGI 3 preview agent
+        (arxiv:2512.24156), which uses exactly this pattern and beats frontier
+        LLMs without any neural network.
+        """
+        cur_hash = self._current_frame_hash
+        if cur_hash is None:
+            return 0.0
+        edge_key: Tuple[int, int, int] = (
+            (int(action_id), int(x), int(y)) if int(action_id) == 6 else (int(action_id), 0, 0)
+        )
+        edges_here = self.state_graph.get(cur_hash, {})
+        if edge_key not in edges_here:
+            # Direct novelty: this (state, action) pair never tried.
+            return 0.30
+        next_hash = edges_here[edge_key]
+        if next_hash == cur_hash:
+            # Self-loop: action is a confirmed no-op from this state. No bonus.
+            return 0.0
+        # BFS from next_hash to find a state with unexplored actions.
+        visited = {cur_hash, next_hash}
+        queue: List[Tuple[str, int]] = [(next_hash, 1)]
+        while queue:
+            node_hash, depth = queue.pop(0)
+            if depth > 4:
+                break
+            node_edges = self.state_graph.get(node_hash, {})
+            # Heuristic: a state with < 4 outgoing edges almost certainly has
+            # unexplored actions remaining (max action_id=7 + many ACTION6 coords).
+            if len(node_edges) < 4:
+                return 0.18 / float(depth)
+            for child_hash in node_edges.values():
+                if child_hash not in visited:
+                    visited.add(child_hash)
+                    queue.append((child_hash, depth + 1))
+        return 0.0
+
     def _policy_output(
         self,
         available_actions: Sequence[int],
@@ -280,6 +366,8 @@ class PolicyGuidedAgent:
         output = self._policy_output(available_actions, levels_completed, step_index)
         candidates: List[CandidateAction] = []
         available_set = set(int(action) for action in available_actions)
+        # Track 2: anchor the current-state hash for novelty lookups in this step.
+        self._current_frame_hash = frame_hash(frame)
 
         for action_id in ACTION_IDS:
             if action_id not in available_set:
@@ -315,6 +403,7 @@ class PolicyGuidedAgent:
                     if action_id in self.risky_actions:
                         score -= 0.5
                     score += self._coord_distance_bonus((x, y))
+                    score += self._state_graph_novelty_bonus(action_id, x, y)
                     score -= self._recent_repeat_penalty(action_id)
                     score -= self._coord_repeat_penalty((x, y))
                     score -= self._dead_click_penalty()
@@ -339,6 +428,7 @@ class PolicyGuidedAgent:
                     score -= 0.5
                 if self.last_action_id == action_id and self.steps_since_progress > 2:
                     score -= 0.1
+                score += self._state_graph_novelty_bonus(action_id, 0, 0)
                 score -= self._recent_repeat_penalty(action_id)
                 if output is None:
                     score += self.rng.uniform(0.0, 0.05)
@@ -455,6 +545,19 @@ class PolicyGuidedAgent:
         self.delta_history.append(delta)
         self.last_action_id = action.action_id
         self.history_frames.append([[int(value) for value in row] for row in next_frame])
+        # Track 2: record the (state, action) -> next_state edge in the graph.
+        new_hash = frame_hash(next_frame)
+        if self._current_frame_hash is not None:
+            if action.action_id == 6 and action.action_data is not None:
+                edge_key = (
+                    int(action.action_id),
+                    int(action.action_data.get("x", 0)),
+                    int(action.action_data.get("y", 0)),
+                )
+            else:
+                edge_key = (int(action.action_id), 0, 0)
+            self.state_graph.setdefault(self._current_frame_hash, {})[edge_key] = new_hash
+        self._current_frame_hash = new_hash
         return novelty
 
     def should_abort_stalled_run(self) -> bool:
