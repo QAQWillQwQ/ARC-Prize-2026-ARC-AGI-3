@@ -117,6 +117,8 @@ class PolicyGuidedAgent:
         self.action_effect: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success: Dict[int, float] = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points: Dict[Tuple[int, int], int] = {}
+        self.dead_click_run = 0
+        self.dead_click_total = 0
         self.rng = random.Random(random_seed)
         self.game_prior = dict(game_prior or {})
         raw_action_scores = dict(self.game_prior.get("action_scores") or {})
@@ -151,6 +153,8 @@ class PolicyGuidedAgent:
         self.action_effect = {action_id: 0.0 for action_id in ACTION_IDS}
         self.action_success = {action_id: 0.0 for action_id in ACTION_IDS}
         self.tried_points = {}
+        self.dead_click_run = 0
+        self.dead_click_total = 0
 
     def _repeated_template_penalty(self, action_id: int) -> float:
         history = list(self.action_history)
@@ -237,6 +241,17 @@ class PolicyGuidedAgent:
         distance = abs(last_x - point[0]) + abs(last_y - point[1])
         return min(distance / 48.0, 0.35)
 
+    def _dead_click_penalty(self) -> float:
+        # Grace period right after a level transition: don't escalate.
+        if self.steps_since_progress < 4:
+            return 0.0
+        penalty = 0.0
+        if self.dead_click_run >= 2:
+            penalty += min(0.4 * float(self.dead_click_run), 2.0)
+        if self.dead_click_total >= 6 and self.steps_since_progress >= 8:
+            penalty += 0.6
+        return penalty
+
     def _policy_output(
         self,
         available_actions: Sequence[int],
@@ -302,6 +317,7 @@ class PolicyGuidedAgent:
                     score += self._coord_distance_bonus((x, y))
                     score -= self._recent_repeat_penalty(action_id)
                     score -= self._coord_repeat_penalty((x, y))
+                    score -= self._dead_click_penalty()
                     if output is None:
                         score += self.rng.uniform(0.0, 0.05)
                     candidates.append(
@@ -414,12 +430,21 @@ class PolicyGuidedAgent:
         if levels_after > levels_before:
             self.action_success[action.action_id] = (self.action_success[action.action_id] * 0.5) + 0.5
             self.steps_since_progress = 0
+            # New level: fresh dead-click budget.
+            self.dead_click_run = 0
+            self.dead_click_total = 0
         else:
             if repeated_recent or reverse or two_cycle or template_repeat > 0.0 or (action.action_id == 6 and delta == 0):
                 self.action_success[action.action_id] *= 0.9
             else:
                 self.action_success[action.action_id] *= 0.97
             self.steps_since_progress += 1
+        if action.action_id == 6:
+            if delta == 0:
+                self.dead_click_run += 1
+                self.dead_click_total += 1
+            else:
+                self.dead_click_run = 0
         self.current_levels_completed = int(levels_after)
         self.zero_delta_streak = next_zero_delta_streak
         self.low_delta_streak = next_low_delta_streak

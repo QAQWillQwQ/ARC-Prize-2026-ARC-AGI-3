@@ -80,6 +80,26 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "weight_decay": 0.05,
         "online_val_every": 3,
     },
+    "rtx4070super": {
+        "batch_size": 96,
+        "grad_accum": 2,
+        "model_dim": 384,
+        "num_slots": 8,
+        "depth": 6,
+        "num_heads": 8,
+        "history": 4,
+        "collect_episodes_per_game": 16,
+        "beam_width": 6,
+        "branch_factor": 10,
+        "coord_budget": 20,
+        "epochs": 16,
+        "lr": 3e-4,
+        "weight_decay": 0.05,
+        "online_val_every": 2,
+        "decoder_dim": 64,
+        "slot_iters": 1,
+        "collect_workers": 16,
+    },
     "cpu_debug": {
         "batch_size": 4,
         "grad_accum": 1,
@@ -209,30 +229,154 @@ def action_mask(available_actions: Sequence[int]) -> List[int]:
     return [1 if action_id in available else 0 for action_id in ACTION_IDS]
 
 
-def final_subframe(frame_stack: Sequence[Sequence[Sequence[int]]]) -> List[List[int]]:
+_FINAL_SUBFRAME_NON_CANONICAL_WARNED = False
+_SAFE_COLOR_TYPES_SEEN: set = set()
+_SAFE_COLOR_WARNS_REMAINING = 5
+
+
+def _is_iterable(obj: Any) -> bool:
+    return hasattr(obj, "__iter__") and not isinstance(obj, (str, bytes))
+
+
+def _safe_color(value: Any) -> int:
+    """Coerce ``value`` to an int in ``[0, 15]``. Returns 0 on any conversion failure.
+
+    Logs each new failure type up to 5 times per process so we can see what
+    arcengine is actually putting in frame cells (e.g., 'function', 'NoneType',
+    custom wrapper classes). After 5 distinct failure types, further failures
+    are silent — we just substitute 0.
+
+    This is the single coercion point used by every frame-iterating helper
+    (``frame_hash``, ``frame_delta``, ``non_background_density``,
+    ``connected_components``, ``changed_points``, ``one_hot_frames``,
+    ``pad_history``) so that NO downstream consumer crashes on bad cells.
+    """
+    global _SAFE_COLOR_WARNS_REMAINING
+    try:
+        return int(value) & 0x0F
+    except (TypeError, ValueError):
+        type_name = type(value).__name__
+        if type_name not in _SAFE_COLOR_TYPES_SEEN and _SAFE_COLOR_WARNS_REMAINING > 0:
+            _SAFE_COLOR_TYPES_SEEN.add(type_name)
+            _SAFE_COLOR_WARNS_REMAINING -= 1
+            print(
+                "[_safe_color] non-int value of type %r in frame; substituting 0. "
+                "(repr: %s)" % (type_name, repr(value)[:80]),
+                flush=True,
+            )
+        return 0
+
+
+def final_subframe(frame_stack: Sequence) -> List[List[int]]:
+    """Normalize an arcengine FrameData.frame to a clean 64x64 ``List[List[int]]``.
+
+    Defensive: if the input is not the canonical 3-D ``[[[...]]]`` shape the
+    annotation promises, this function falls back to a best-effort interpretation
+    rather than crashing. Specifically it handles:
+
+    - empty ``frame_stack``  -> 64x64 of zeros
+    - canonical 3-D stack    -> last 2-D frame, padded / truncated to 64x64
+    - 2-D frame at top level (degenerate but observed) -> use as the frame
+    - jagged or short rows   -> pad with zeros
+    - non-iterable rows      -> replace with a zero row
+    - out-of-range color ints -> clamp to ``[0, 15]`` via ``& 0x0F``
+
+    Emits a one-time stderr warning per process the first time a non-canonical
+    shape is encountered, so we can root-cause without spamming logs. Downstream
+    callers (``frame_hash``, ``frame_delta``, ``connected_components``) can then
+    assume a clean 64x64 list-of-lists.
+    """
+    global _FINAL_SUBFRAME_NON_CANONICAL_WARNED
+
+    blank_row = [0] * GRID_SIZE
+
+    def blank_grid() -> List[List[int]]:
+        return [list(blank_row) for _ in range(GRID_SIZE)]
+
+    def warn_once(reason: str) -> None:
+        global _FINAL_SUBFRAME_NON_CANONICAL_WARNED
+        if not _FINAL_SUBFRAME_NON_CANONICAL_WARNED:
+            _FINAL_SUBFRAME_NON_CANONICAL_WARNED = True
+            print(
+                "[final_subframe] non-canonical frame shape (%s); padding to %dx%d. "
+                "Subsequent occurrences are silenced." % (reason, GRID_SIZE, GRID_SIZE),
+                flush=True,
+            )
+
     if not frame_stack:
-        return [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
-    frame = frame_stack[-1]
-    return [[int(value) for value in row] for row in frame]
+        return blank_grid()
+    try:
+        candidate = frame_stack[-1]
+    except (TypeError, IndexError):
+        warn_once("frame_stack[-1] failed")
+        return blank_grid()
+    if not _is_iterable(candidate):
+        warn_once("frame_stack[-1] is %s, not iterable" % type(candidate).__name__)
+        return blank_grid()
+
+    rows = list(candidate)
+    if rows and not _is_iterable(rows[0]):
+        warn_once("frame_stack[-1][0] is %s, treating frame_stack as 2-D" % type(rows[0]).__name__)
+        rows = list(frame_stack)
+    if not rows:
+        return blank_grid()
+
+    out: List[List[int]] = []
+    needed_padding = False
+    for row in rows[:GRID_SIZE]:
+        if not _is_iterable(row):
+            out.append(list(blank_row))
+            needed_padding = True
+            continue
+        ints: List[int] = []
+        for v in row:
+            try:
+                ints.append(int(v) & 0x0F)
+            except (TypeError, ValueError):
+                ints.append(0)
+                needed_padding = True
+            if len(ints) >= GRID_SIZE:
+                break
+        if len(ints) < GRID_SIZE:
+            ints.extend([0] * (GRID_SIZE - len(ints)))
+            needed_padding = True
+        out.append(ints)
+    if len(out) < GRID_SIZE:
+        for _ in range(GRID_SIZE - len(out)):
+            out.append(list(blank_row))
+        needed_padding = True
+    if needed_padding:
+        warn_once("rows or row-lengths needed padding")
+    return out
 
 
 def frame_hash(frame: Sequence[Sequence[int]]) -> str:
-    flat = bytes(int(value) & 0x0F for row in frame for value in row)
-    return hashlib.sha1(flat).hexdigest()
+    """Hash a frame to a stable hex digest. Robust to non-int cells via _safe_color."""
+    values: List[int] = []
+    for row in frame:
+        if not _is_iterable(row):
+            continue
+        for value in row:
+            values.append(_safe_color(value))
+    return hashlib.sha1(bytes(values)).hexdigest()
 
 
 def frame_delta(prev_frame: Sequence[Sequence[int]], next_frame: Sequence[Sequence[int]]) -> int:
+    """Count cells whose color changed. Robust to non-int cells via _safe_color."""
     delta = 0
     for y in range(min(len(prev_frame), len(next_frame))):
         row_a = prev_frame[y]
         row_b = next_frame[y]
+        if not _is_iterable(row_a) or not _is_iterable(row_b):
+            continue
         for x in range(min(len(row_a), len(row_b))):
-            if int(row_a[x]) != int(row_b[x]):
+            if _safe_color(row_a[x]) != _safe_color(row_b[x]):
                 delta += 1
     return delta
 
 
 def non_background_density(frame: Sequence[Sequence[int]]) -> float:
+    """Fraction of cells that are non-background (color != 0). Robust to non-int cells."""
     if torch.is_tensor(frame):
         if frame.numel() == 0:
             return 0.0
@@ -240,8 +384,10 @@ def non_background_density(frame: Sequence[Sequence[int]]) -> float:
     total = GRID_SIZE * GRID_SIZE
     occupied = 0
     for row in frame:
+        if not _is_iterable(row):
+            continue
         for value in row:
-            if int(value) != 0:
+            if _safe_color(value) != 0:
                 occupied += 1
     return occupied / float(total)
 
@@ -254,13 +400,28 @@ def _grid_points(step: int) -> List[Tuple[int, int]]:
     return coords
 
 
+def _frame_cell(frame: Sequence[Sequence[int]], y: int, x: int) -> int:
+    """Read frame[y][x] coerced to a safe color int. Robust to short/missing rows."""
+    try:
+        row = frame[y]
+    except (TypeError, IndexError):
+        return 0
+    if not _is_iterable(row):
+        return 0
+    try:
+        return _safe_color(row[x])
+    except (TypeError, IndexError):
+        return 0
+
+
 def connected_components(frame: Sequence[Sequence[int]]) -> List[Dict[str, Any]]:
+    """Flood-fill connected color regions. Robust to non-int cells via _frame_cell."""
     visited = [[False for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
     components: List[Dict[str, Any]] = []
     offsets = [(1, 0), (-1, 0), (0, 1), (0, -1)]
     for y in range(GRID_SIZE):
         for x in range(GRID_SIZE):
-            color = int(frame[y][x])
+            color = _frame_cell(frame, y, x)
             if color == 0 or visited[y][x]:
                 continue
             stack = [(x, y)]
@@ -276,7 +437,7 @@ def connected_components(frame: Sequence[Sequence[int]]) -> List[Dict[str, Any]]
                         continue
                     if visited[ny][nx]:
                         continue
-                    if int(frame[ny][nx]) != color:
+                    if _frame_cell(frame, ny, nx) != color:
                         continue
                     visited[ny][nx] = True
                     stack.append((nx, ny))
@@ -296,10 +457,11 @@ def connected_components(frame: Sequence[Sequence[int]]) -> List[Dict[str, Any]]
 
 
 def changed_points(prev_frame: Sequence[Sequence[int]], next_frame: Sequence[Sequence[int]]) -> List[Tuple[int, int]]:
+    """Coordinates where prev and next differ. Robust to non-int cells via _frame_cell."""
     points: List[Tuple[int, int]] = []
     for y in range(GRID_SIZE):
         for x in range(GRID_SIZE):
-            if int(prev_frame[y][x]) != int(next_frame[y][x]):
+            if _frame_cell(prev_frame, y, x) != _frame_cell(next_frame, y, x):
                 points.append((x, y))
     return points
 
@@ -346,26 +508,40 @@ def salient_points(
 
 
 def one_hot_frames(history: Sequence[Sequence[Sequence[int]]]) -> torch.Tensor:
+    """One-hot encode a frame history. Robust to non-int cells (those become color 0)."""
     encoded = torch.zeros((len(history) * NUM_COLORS, GRID_SIZE, GRID_SIZE), dtype=torch.float32)
     for frame_idx, frame in enumerate(history):
         for y in range(GRID_SIZE):
-            row = frame[y]
+            try:
+                row = frame[y]
+            except (TypeError, IndexError):
+                continue
+            if not _is_iterable(row):
+                continue
             for x in range(GRID_SIZE):
-                color = int(row[x])
-                if color < 0 or color >= NUM_COLORS:
-                    color = 0
+                try:
+                    raw = row[x]
+                except (TypeError, IndexError):
+                    continue
+                color = _safe_color(raw)
                 encoded[frame_idx * NUM_COLORS + color, y, x] = 1.0
     return encoded
 
 
 def pad_history(frames: Sequence[Sequence[Sequence[int]]], history: int) -> List[List[List[int]]]:
+    """Pad a frame history to ``history`` frames. Robust to non-int cells."""
     if not frames:
         blank = [[0 for _ in range(GRID_SIZE)] for _ in range(GRID_SIZE)]
         return [blank for _ in range(history)]
-    stacked = [
-        [[int(value) for value in row] for row in frame]
-        for frame in frames[-history:]
-    ]
+    stacked: List[List[List[int]]] = []
+    for frame in frames[-history:]:
+        rows: List[List[int]] = []
+        for row in frame:
+            if _is_iterable(row):
+                rows.append([_safe_color(v) for v in row])
+            else:
+                rows.append([0 for _ in range(GRID_SIZE)])
+        stacked.append(rows)
     while len(stacked) < history:
         stacked.insert(0, [row[:] for row in stacked[0]])
     return stacked

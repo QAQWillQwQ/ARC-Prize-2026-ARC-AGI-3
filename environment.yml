@@ -1,0 +1,71 @@
+# Conda environment for ARC AGI 3 development.
+#
+# Creates a Python 3.12 env named `arc312` with:
+#   - PyTorch 2.5.1 + CUDA 12.1
+#   - All bundled wheels (arc_agi, arcengine, plus cp312 deps for Kaggle parity)
+#   - Visualization extras (matplotlib, tqdm)
+#
+# Usage (from project root, on Linux/WSL):
+#   conda env create -f environment.yml
+#   conda activate arc312
+#   python -c "import arc_agi, arcengine, torch; print('cuda=', torch.cuda.is_available())"
+#
+# To recreate from scratch:
+#   conda env remove -n arc312 -y && conda env create -f environment.yml
+#
+# To update an existing env after editing this file:
+#   conda env update -n arc312 -f environment.yml --prune
+#
+# Notes:
+#   - Linux only. Bundled wheels are manylinux_2_28 / cp312.
+#   - On Mac, install torch + arc_agi + arcengine from PyPI directly (gotchas.md #2).
+#   - Re-run after pulling repo updates if the bundled wheels change.
+name: arc312
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.12
+  - pip>=24
+  - pip:
+      # PyTorch with CUDA 12.1 (matches sm_89 / Ada Lovelace on RTX 4070 Super).
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+      - torch==2.5.1+cu121
+
+      # Bundled wheels (Linux-only, cp312). The first two are universal-py3
+      # but pin Requires-Python>=3.12 in metadata; the rest are cp312 binary
+      # wheels that match Kaggle's runtime so deps are reproducible.
+      - ./arc_agi_3_wheels/arc_agi-0.9.8-py3-none-any.whl
+      - ./arc_agi_3_wheels/arcengine-0.9.3-py3-none-any.whl
+      - ./arc_agi_3_wheels/annotated_types-0.7.0-py3-none-any.whl
+      - ./arc_agi_3_wheels/blinker-1.9.0-py3-none-any.whl
+      - ./arc_agi_3_wheels/certifi-2026.2.25-py3-none-any.whl
+      - ./arc_agi_3_wheels/charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+      - ./arc_agi_3_wheels/click-8.3.2-py3-none-any.whl
+      - ./arc_agi_3_wheels/contourpy-1.3.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - ./arc_agi_3_wheels/cycler-0.12.1-py3-none-any.whl
+      - ./arc_agi_3_wheels/flask-3.1.3-py3-none-any.whl
+      - ./arc_agi_3_wheels/fonttools-4.62.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - ./arc_agi_3_wheels/idna-3.11-py3-none-any.whl
+      - ./arc_agi_3_wheels/itsdangerous-2.2.0-py3-none-any.whl
+      - ./arc_agi_3_wheels/jinja2-3.1.6-py3-none-any.whl
+      - ./arc_agi_3_wheels/kiwisolver-1.5.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - ./arc_agi_3_wheels/markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl
+      - ./arc_agi_3_wheels/matplotlib-3.10.8-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - ./arc_agi_3_wheels/numpy-2.4.4-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - ./arc_agi_3_wheels/packaging-26.1-py3-none-any.whl
+      - ./arc_agi_3_wheels/pillow-12.2.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
+      - ./arc_agi_3_wheels/pydantic-2.13.2-py3-none-any.whl
+      - ./arc_agi_3_wheels/pydantic_core-2.46.2-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
+      - ./arc_agi_3_wheels/pyparsing-3.3.2-py3-none-any.whl
+      - ./arc_agi_3_wheels/python_dateutil-2.9.0.post0-py2.py3-none-any.whl
+      - ./arc_agi_3_wheels/python_dotenv-1.2.2-py3-none-any.whl
+      - ./arc_agi_3_wheels/requests-2.33.1-py3-none-any.whl
+      - ./arc_agi_3_wheels/six-1.17.0-py2.py3-none-any.whl
+      - ./arc_agi_3_wheels/typing_extensions-4.15.0-py3-none-any.whl
+      - ./arc_agi_3_wheels/typing_inspection-0.4.2-py3-none-any.whl
+      - ./arc_agi_3_wheels/urllib3-2.6.3-py3-none-any.whl
+
+      # Helpful extras not in the bundled wheel set.
+      - tqdm

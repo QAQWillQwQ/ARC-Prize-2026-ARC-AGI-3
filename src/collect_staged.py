@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import traceback
+from concurrent.futures import BrokenExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -658,29 +661,107 @@ def main() -> None:
             flush=True,
         )
 
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(collect_episode_task, task) for task in tasks]
-            for future in as_completed(futures):
-                episode = future.result()
-                episode["stage_name"] = stage.name
-                episode["stage_index"] = stage_index
-                append_jsonl_gz(episodes_path, episode)
-                update_game_stats(game_stats, episode)
-                stage_completed += 1
-                overall_completed += 1
+        # Resilient pool execution: recover from `BrokenProcessPool` by retrying
+        # remaining tasks with a smaller worker pool. `max_tasks_per_child`
+        # recycles workers periodically so accumulated memory is released.
+        remaining_tasks: List[Any] = list(tasks)
+        max_pool_retries = 3
+        retry_attempt = 0
+        current_workers = max(1, int(workers))
+
+        while remaining_tasks:
+            retry_attempt += 1
+            if retry_attempt > max_pool_retries:
                 print(
-                    summarize_stage_progress(
-                        episode=episode,
-                        stage_name=stage.name,
-                        stage_completed=stage_completed,
-                        stage_total=stage_total,
-                        overall_completed=overall_completed,
-                        overall_total=planned_total,
-                        stage_start_time=stage_start_time,
-                        overall_start_time=overall_start_time,
-                    ),
+                    "[stage] giving up on %d tasks after %d retries; continuing to next stage"
+                    % (len(remaining_tasks), max_pool_retries),
                     flush=True,
                 )
+                break
+
+            executor_kwargs: Dict[str, Any] = {"max_workers": current_workers}
+            if sys.version_info >= (3, 11):
+                # Recycle workers periodically to release accumulated memory.
+                # Empirical: arcengine workers grow ~150-200 MB per task; at
+                # 16 workers a value of 8 caps total peak around ~12 GB.
+                executor_kwargs["max_tasks_per_child"] = 8
+            if retry_attempt > 1:
+                print(
+                    "[stage] retry %d/%d with workers=%d remaining=%d"
+                    % (retry_attempt, max_pool_retries, current_workers, len(remaining_tasks)),
+                    flush=True,
+                )
+
+            completed_tasks: List[Any] = []
+            try:
+                with ProcessPoolExecutor(**executor_kwargs) as executor:
+                    future_to_task = {
+                        executor.submit(collect_episode_task, task): task for task in remaining_tasks
+                    }
+                    for future in as_completed(future_to_task):
+                        try:
+                            episode = future.result()
+                        except (BrokenProcessPool, BrokenExecutor):
+                            # Pool is dead; abort this attempt, retry remaining.
+                            raise
+                        except Exception as exc:
+                            # Capture and print full traceback so we can diagnose post-hoc.
+                            # This is the only place the worker's traceback survives — once
+                            # we drop the exception via `continue`, the trace is gone.
+                            tb = "".join(
+                                traceback.format_exception(type(exc), exc, exc.__traceback__)
+                            )
+                            failed_task = future_to_task[future]
+                            task_repr = (
+                                "%s/seed=%s" % (
+                                    getattr(failed_task, "stage_name", "?"),
+                                    getattr(failed_task, "seed", "?"),
+                                )
+                                if not isinstance(failed_task, dict)
+                                else "%s/%s/seed=%s" % (
+                                    failed_task.get("stage_name", "?"),
+                                    failed_task.get("game_id", "?"),
+                                    failed_task.get("seed", "?"),
+                                )
+                            )
+                            print(
+                                "[stage] worker exception in task %s (%s): %s; skipping. Traceback:\n%s"
+                                % (task_repr, type(exc).__name__, exc, tb),
+                                flush=True,
+                            )
+                            completed_tasks.append(future_to_task[future])
+                            continue
+                        episode["stage_name"] = stage.name
+                        episode["stage_index"] = stage_index
+                        append_jsonl_gz(episodes_path, episode)
+                        update_game_stats(game_stats, episode)
+                        stage_completed += 1
+                        overall_completed += 1
+                        print(
+                            summarize_stage_progress(
+                                episode=episode,
+                                stage_name=stage.name,
+                                stage_completed=stage_completed,
+                                stage_total=stage_total,
+                                overall_completed=overall_completed,
+                                overall_total=planned_total,
+                                stage_start_time=stage_start_time,
+                                overall_start_time=overall_start_time,
+                            ),
+                            flush=True,
+                        )
+                        completed_tasks.append(future_to_task[future])
+            except (BrokenProcessPool, BrokenExecutor) as exc:
+                print(
+                    "[stage] %s — pool died, will retry remaining tasks with smaller pool"
+                    % type(exc).__name__,
+                    flush=True,
+                )
+                # Halve workers on retry so each survivor gets more memory headroom.
+                current_workers = max(1, current_workers // 2)
+
+            completed_ids = {id(task) for task in completed_tasks}
+            remaining_tasks = [task for task in remaining_tasks if id(task) not in completed_ids]
 
         stage_elapsed = time.perf_counter() - stage_start_time
         stage_results.append(

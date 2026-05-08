@@ -85,14 +85,26 @@ class EpisodeTransitionDataset(Dataset):
                 steps_since_progress += 1
 
         episode_index = len(self.episodes)
+        final_state = str(episode.get("final_state", "NOT_FINISHED"))
+        levels_completed = int(episode.get("levels_completed", 0))
+        episode_score = float(episode.get("score", 0.0))
+        if final_state == "WIN":
+            weight_mult = 4.0
+        elif levels_completed >= 2:
+            weight_mult = 2.5
+        elif levels_completed >= 1 or episode_score > 0.0:
+            weight_mult = 1.5
+        else:
+            weight_mult = 0.4
         self.episodes.append(
             {
                 "transitions": transitions,
                 "frames": torch.tensor(frame_list, dtype=torch.uint8),
                 "returns": returns,
-                "score": float(episode.get("score", 0.0)),
+                "score": episode_score,
                 "last_action_before": last_action_before,
                 "steps_before": steps_before,
+                "weight_mult": weight_mult,
             }
         )
         self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
@@ -144,9 +156,12 @@ class EpisodeTransitionDataset(Dataset):
             "coord_mask": torch.tensor(1.0 if action_id == 6 else 0.0, dtype=torch.float32),
             "return_target": torch.tensor(float(episode["returns"][transition_index]), dtype=torch.float32),
             "weight": torch.tensor(
-                1.0
-                + (float(episode["score"]) / 100.0)
-                + max(0, progress) * 2.0,
+                float(episode["weight_mult"])
+                * (
+                    1.0
+                    + (float(episode["score"]) / 100.0)
+                    + max(0, progress) * 2.0
+                ),
                 dtype=torch.float32,
             ),
         }
