@@ -19,9 +19,16 @@
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PY="${PY:-/home/jihangli/miniconda3/envs/arc312/bin/python}"
-if [ ! -x "$PY" ]; then
-  PY="$(command -v python3.12 || command -v python3 || command -v python)"
+# Resolve Python interpreter: respect PY env var, otherwise fall back to PATH.
+# After activating an arc312 venv (conda or python -m venv), `python` is the
+# right interpreter. Override with `PY=/path/to/python` if needed.
+PY="${PY:-python}"
+if ! command -v "$PY" >/dev/null 2>&1; then
+  PY="$(command -v python3.12 || command -v python3 || true)"
+fi
+if [ -z "$PY" ] || ! command -v "$PY" >/dev/null 2>&1; then
+  echo "[run-collect] ERROR: no python interpreter found. Activate your venv first or set PY=/path/to/python." >&2
+  exit 1
 fi
 
 LOG_DIR="$PROJECT_ROOT/Local_Output/Logs"
