@@ -45,8 +45,12 @@ Output: <output-root>/collected/episodes.jsonl.gz with episodes tagged by
 from __future__ import annotations
 
 import argparse
+import atexit
+import gzip
 import json
+import os
 import random as pyrandom
+import shutil
 import sys
 import time
 import traceback
@@ -89,12 +93,41 @@ from src.common import (  # noqa: E402
 _WORKER_ARC: Optional[Arcade] = None
 _WORKER_ENVS: Dict[str, Any] = {}
 
+# Path A (memory-leak fix): each worker writes full episodes (with transitions)
+# to its OWN gz shard file. Only a tiny per-task summary (no transitions) is
+# returned to the parent. This eliminates the parent-side futures backlog of
+# ~108 MB Python payloads that drove RAM growth from 6 GB → 18 GB in 90s.
+_WORKER_GZ_HANDLE: Optional[Any] = None
+_WORKER_GZ_PATH: Optional[Path] = None
 
-def _init_worker(project_root_str: str, recordings_dir_str: str, priors_path_str: Optional[str]) -> None:
-    """ProcessPoolExecutor initializer. Creates one Arcade per worker."""
-    global _WORKER_ARC, _WORKER_ENVS
+
+def _close_worker_gz() -> None:
+    """atexit hook: flush + close the per-worker gz shard.
+
+    Fires on graceful worker exit (max_tasks_per_child recycle, pool.shutdown,
+    KeyboardInterrupt). Does NOT fire on SIGKILL, but we also flush() after
+    every write below to bound data loss to at most one episode.
+    """
+    global _WORKER_GZ_HANDLE
+    if _WORKER_GZ_HANDLE is not None:
+        try:
+            _WORKER_GZ_HANDLE.flush()
+            _WORKER_GZ_HANDLE.close()
+        except Exception:
+            pass
+        _WORKER_GZ_HANDLE = None
+
+
+def _init_worker(
+    project_root_str: str,
+    recordings_dir_str: str,
+    priors_path_str: Optional[str],
+    shard_dir_str: str,
+) -> None:
+    """ProcessPoolExecutor initializer. Creates one Arcade per worker + opens
+    the per-worker gz shard."""
+    global _WORKER_ARC, _WORKER_ENVS, _WORKER_GZ_HANDLE, _WORKER_GZ_PATH
     if priors_path_str:
-        import os
         os.environ.setdefault("ARC_PRIORS_PATH", priors_path_str)
     _WORKER_ARC = Arcade(
         operation_mode=OperationMode.OFFLINE,
@@ -102,6 +135,33 @@ def _init_worker(project_root_str: str, recordings_dir_str: str, priors_path_str
         recordings_dir=str(recordings_dir_str),
     )
     _WORKER_ENVS = {}
+    # Each worker process gets its own shard file keyed by PID. When workers
+    # are recycled (max_tasks_per_child=50), a new PID is assigned and a new
+    # shard file is created — no clobber.
+    shard_dir = Path(shard_dir_str)
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    _WORKER_GZ_PATH = shard_dir / f"shard_{os.getpid()}.jsonl.gz"
+    _WORKER_GZ_HANDLE = gzip.open(_WORKER_GZ_PATH, "at", encoding="utf-8")
+    atexit.register(_close_worker_gz)
+
+
+def _write_episode_locally(payload: Dict[str, Any]) -> bool:
+    """Write one episode line into this worker's gz shard. Returns success.
+
+    Each call flushes the gzip stream (Z_SYNC_FLUSH) so a SIGKILL between
+    episodes loses at most the in-flight task. Slight compression-ratio cost
+    (~5%) is acceptable; the alternative is silently losing entire shards.
+    """
+    global _WORKER_GZ_HANDLE
+    if _WORKER_GZ_HANDLE is None:
+        return False
+    try:
+        _WORKER_GZ_HANDLE.write(json.dumps(payload, ensure_ascii=True))
+        _WORKER_GZ_HANDLE.write("\n")
+        _WORKER_GZ_HANDLE.flush()
+        return True
+    except Exception:
+        return False
 
 
 def _get_or_make_env(arc: Arcade, full_id: str) -> Any:
@@ -616,7 +676,7 @@ def collect_one(
         raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
     )
     levels = int(getattr(raw_obs, "levels_completed", 0) or 0)
-    return {
+    full_payload: Dict[str, Any] = {
         "game_id": full_id,
         "short_id": short_id,
         "source": source_tag,
@@ -632,6 +692,19 @@ def collect_one(
         "resets_used": n_resets,
         "transitions": transitions,
     }
+    # Path A: worker writes the full episode (with transitions) to its own gz
+    # shard, then returns only a small summary to the parent. Eliminates the
+    # ~108 MB-per-task IPC payload that backlogged in concurrent.futures.
+    written = _write_episode_locally(full_payload)
+    summary: Dict[str, Any] = {k: v for k, v in full_payload.items() if k != "transitions"}
+    summary["transitions_len"] = len(transitions)
+    summary["shard_written"] = bool(written)
+    if not written:
+        # Worker not running under the pool initializer (e.g., direct script
+        # invocation). Fall back to returning the full payload so the caller
+        # can persist it. This path is intentionally not used in the main run.
+        summary["transitions"] = transitions
+    return summary
 
 
 # ---------------------- task generation ----------------------
@@ -694,6 +767,25 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _concat_shards_to_gz(shard_files: Sequence[Path], gz_path: Path) -> int:
+    """Append per-worker gz shards onto gz_path. gzip is concatenable byte-wise:
+    cat a.gz b.gz produces a valid multi-member gzip readable transparently by
+    gzip.open(..., 'rt'). Returns total bytes copied."""
+    if not shard_files:
+        return 0
+    mode = "ab" if gz_path.exists() else "wb"
+    total = 0
+    with open(gz_path, mode) as out:
+        for sf in shard_files:
+            try:
+                with open(sf, "rb") as inp:
+                    shutil.copyfileobj(inp, out, length=64 * 1024 * 1024)
+                total += sf.stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
+
+
 def main() -> int:
     args = parse_args()
     project_root = Path(args.project_root).resolve()
@@ -704,6 +796,24 @@ def main() -> int:
     gz_path = out_dir / "episodes.jsonl.gz"
     recordings_dir = output_root / "recordings"
     recordings_dir.mkdir(parents=True, exist_ok=True)
+    # Path A: per-worker gz shards live under output_root/collected/shards/.
+    # If a prior run died without concatenating, recover those shards onto
+    # gz_path now (before this run produces any new shards).
+    shard_dir = out_dir / "shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    pre_existing_shards = sorted(shard_dir.glob("shard_*.jsonl.gz"))
+    if pre_existing_shards:
+        bytes_recovered = _concat_shards_to_gz(pre_existing_shards, gz_path)
+        print(
+            f"[collect-gt] recovered {len(pre_existing_shards)} pre-existing shard(s) "
+            f"({bytes_recovered/1e6:.1f} MB) → {gz_path}",
+            flush=True,
+        )
+        for sf in pre_existing_shards:
+            try:
+                sf.unlink()
+            except Exception:
+                pass
 
     metas = load_metadata_map(project_root / "environment_files")
     arc = Arcade(
@@ -791,7 +901,7 @@ def main() -> int:
     pool_kwargs: Dict[str, Any] = {
         "max_workers": max(1, int(args.workers)),
         "initializer": _init_worker,
-        "initargs": (str(project_root), str(recordings_dir), priors_for_init),
+        "initargs": (str(project_root), str(recordings_dir), priors_for_init, str(shard_dir)),
     }
     # max_tasks_per_child=50 (Python 3.11+): worker recycled every 50 tasks
     # to bound any leaked state in arc_agi internals. 50 is gentle (vs 5 which
@@ -804,61 +914,86 @@ def main() -> int:
     except Exception:
         pass
 
-    with ProcessPoolExecutor(**pool_kwargs) as pool:
-        futures = {
-            pool.submit(
-                collect_one,
-                full_id, short_id, dev, seed, args.max_steps, perturb, strat,
-                project_root, recordings_dir,
-            ): (full_id, short_id, dev, seed, perturb, strat)
-            for (full_id, short_id, dev, seed, perturb, strat) in tasks
-        }
-        for fut in as_completed(futures):
-            full_id, short_id, dev, seed, perturb, strat = futures[fut]
-            try:
-                payload = fut.result()
-            except Exception as exc:
-                payload = {"game_id": full_id, "error": str(exc)}
-            append_jsonl_gz(gz_path, payload)
-            completed += 1
-            tag = payload.get("source", "?")
-            bucket_counts[tag] = bucket_counts.get(tag, 0) + 1
-            wall = time.time() - t0
-            err = payload.get("error")
-            if err:
-                n_errors += 1
-            lvl = payload.get("levels_completed", "?")
-            n_act = payload.get("actions_taken", "?")
-            # Log every 50 completed OR at end OR every 30 wall-seconds OR on error.
-            now = time.time()
-            should_log = (
-                completed % 50 == 0
-                or completed == total
-                or (now - last_log_t) >= 30.0
-                or err
-            )
-            if should_log:
-                last_log_t = now
-                rate = completed / max(0.001, wall)
-                eta_secs = (total - completed) / max(0.001, rate)
-                pct = 100.0 * completed / max(1, total)
+    try:
+        with ProcessPoolExecutor(**pool_kwargs) as pool:
+            futures = {
+                pool.submit(
+                    collect_one,
+                    full_id, short_id, dev, seed, args.max_steps, perturb, strat,
+                    project_root, recordings_dir,
+                ): (full_id, short_id, dev, seed, perturb, strat)
+                for (full_id, short_id, dev, seed, perturb, strat) in tasks
+            }
+            for fut in as_completed(futures):
+                full_id, short_id, dev, seed, perturb, strat = futures[fut]
+                try:
+                    payload = fut.result()
+                except Exception as exc:
+                    payload = {"game_id": full_id, "error": str(exc)}
+                # Path A: payload is now a tiny summary dict (no transitions).
+                # Workers wrote the full episode to their own gz shard inside
+                # collect_one. Parent only does bookkeeping + logging here.
+                completed += 1
+                tag = payload.get("source", "?")
+                bucket_counts[tag] = bucket_counts.get(tag, 0) + 1
+                wall = time.time() - t0
+                err = payload.get("error")
                 if err:
-                    print(
-                        f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
-                        f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
-                        f"rate={rate:.2f}/s errs={n_errors} :: {short_id} ERR={err}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
-                        f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
-                        f"rate={rate:.2f}/s errs={n_errors} buckets={dict(bucket_counts)} "
-                        f":: {short_id} dev={int(dev*100)}% seed={seed} "
-                        f"perturb={perturb:.2f} strat={strat} levels={lvl} "
-                        f"actions={n_act} tag={tag}",
-                        flush=True,
-                    )
+                    n_errors += 1
+                lvl = payload.get("levels_completed", "?")
+                n_act = payload.get("actions_taken", "?")
+                # Log every 50 completed OR at end OR every 30 wall-seconds OR on error.
+                now = time.time()
+                should_log = (
+                    completed % 50 == 0
+                    or completed == total
+                    or (now - last_log_t) >= 30.0
+                    or err
+                )
+                if should_log:
+                    last_log_t = now
+                    rate = completed / max(0.001, wall)
+                    eta_secs = (total - completed) / max(0.001, rate)
+                    pct = 100.0 * completed / max(1, total)
+                    if err:
+                        print(
+                            f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
+                            f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
+                            f"rate={rate:.2f}/s errs={n_errors} :: {short_id} ERR={err}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
+                            f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
+                            f"rate={rate:.2f}/s errs={n_errors} buckets={dict(bucket_counts)} "
+                            f":: {short_id} dev={int(dev*100)}% seed={seed} "
+                            f"perturb={perturb:.2f} strat={strat} levels={lvl} "
+                            f"actions={n_act} tag={tag}",
+                            flush=True,
+                        )
+                # Drop the Future from the dict so it can be GC'd. Payload is
+                # already tiny under Path A so this is mostly belt-and-braces.
+                del futures[fut]
+    finally:
+        # Always concatenate worker shards onto gz_path, even on
+        # KeyboardInterrupt / unexpected errors. Workers are already shut down
+        # by ProcessPoolExecutor's __exit__ (atexit fires → gz handles flush).
+        new_shards = sorted(shard_dir.glob("shard_*.jsonl.gz"))
+        if new_shards:
+            t_concat = time.time()
+            bytes_written = _concat_shards_to_gz(new_shards, gz_path)
+            for sf in new_shards:
+                try:
+                    sf.unlink()
+                except Exception:
+                    pass
+            print(
+                f"[collect-gt] concat: {len(new_shards)} shard(s) "
+                f"({bytes_written/1e6:.1f} MB) → {gz_path} "
+                f"in {time.time() - t_concat:.1f}s",
+                flush=True,
+            )
 
     save_json(output_root / "summary.json", {
         "tasks_total": total,
