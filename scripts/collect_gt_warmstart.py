@@ -344,8 +344,14 @@ def _phase_b_with_myagent(
     """
     _stub_agents_module()
     # Tell MyAgent NOT to load replay (so Phase A doesn't fire on top of ours).
+    # MUST also pin ARC_PRIORS_PATH explicitly — otherwise MyAgent derives the
+    # priors lookup paths from REPLAY_BASE_DIR.parent and won't find them once
+    # we override REPLAY_BASE_DIR to a fake location.
     import os
     os.environ["ARC_REPLAY_BASE_DIR"] = "/__nonexistent_replay_base_dir__"
+    priors_path = ROOT / "Local_Output" / "per_game_priors.json"
+    if priors_path.is_file() and not os.environ.get("ARC_PRIORS_PATH"):
+        os.environ["ARC_PRIORS_PATH"] = str(priors_path)
     import importlib
     if "my_agent" in sys.modules:
         importlib.reload(sys.modules["my_agent"])
