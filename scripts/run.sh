@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# scripts/run.sh — Step dispatcher for ARC AGI 3 worldmodel pipeline.
+# scripts/run.sh — Step dispatcher for ARC AGI 3 collect / inspect.
 #
 # Linux-only (Openlab, WSL2). Uses Python 3.12 + venv (no conda required).
 #
@@ -10,12 +10,9 @@
 # Commands:
 #   setup [--cpu|--cuda]      Create .venv at project root and install deps
 #   check                     Verify imports + show env status
-#   collect-quick [opts]      Step 1: small-subset collect (default games: sp80,ar25,lp85,r11l,cn04,ls20)
-#   inspect [opts]            Step 2: aggregate stats over a .gz dataset
-#   collect-full [opts]       Step 3: full 25-game collect
-#   pretrain [opts]           Step 4: encoder pretraining
-#   train [opts]              Step 6: joint worldmodel training
-#   eval [opts]               Step 7: Phase 3 sanity eval
+#   collect-quick [opts]      Small-subset collect (default games: sp80,ar25,lp85,r11l,cn04,ls20)
+#   inspect [opts]            Aggregate stats over a .gz dataset
+#   collect-full [opts]       Full 25-game collect
 #   status                    Show running pipeline processes
 #   logs [pattern]            Tail latest log file matching pattern
 #   help [command]            Show help for a specific command
@@ -381,171 +378,11 @@ for g in sorted(per_game_count.keys()):
 PY
 }
 
-# ---------- command: pretrain ----------
-
-cmd_pretrain() {
-  local data=""
-  local output_name="pretrain_v3"
-  local profile="rtx4070super"
-  local epochs=""
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --data) data="$2"; shift 2;;
-      --output-name) output_name="$2"; shift 2;;
-      --profile) profile="$2"; shift 2;;
-      --epochs) epochs="$2"; shift 2;;
-      --help|-h)
-        cat <<EOF
-pretrain — Step 4: encoder pretraining.
-
-Usage: bash scripts/run.sh pretrain --data <gz-path> [options]
-
-  --data PATH            (required) Path to episodes.jsonl.gz (comma-sep for multiple)
-  --output-name NAME     Subdir under Training_Output (default: pretrain_v3)
-  --profile NAME         Hardware profile (default: rtx4070super)
-  --epochs N             Override profile default
-EOF
-        return 0;;
-      *) die "unknown pretrain option: $1";;
-    esac
-  done
-  [ -n "$data" ] || die "pretrain requires --data"
-
-  local args=(
-    -m src.pretrain_encoder
-    --data "$data"
-    --output "${TRAIN_DIR}/${output_name}/encoder.pth"
-    --hardware-profile "$profile"
-    --log-every-batches 50
-  )
-  [ -n "$epochs" ] && args+=(--epochs "$epochs")
-
-  ensure_dir "${TRAIN_DIR}/${output_name}"
-  log "data=$data output_name=$output_name profile=$profile epochs=${epochs:-default}"
-  spawn "pretrain" "${output_name}" "${args[@]}"
-}
-
-# ---------- command: train ----------
-
-cmd_train() {
-  local data=""
-  local output_name="worldmodel_v2"
-  local encoder=""
-  local profile="rtx4070super"
-  local epochs=""
-  local extra=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --data) data="$2"; shift 2;;
-      --output-name) output_name="$2"; shift 2;;
-      --encoder|--pretrained-encoder) encoder="$2"; shift 2;;
-      --profile) profile="$2"; shift 2;;
-      --epochs) epochs="$2"; shift 2;;
-      --) shift; extra+=("$@"); break;;
-      --help|-h)
-        cat <<EOF
-train — Step 6: joint worldmodel training.
-
-Usage: bash scripts/run.sh train --data <gz-path> [options]
-
-  --data PATH            (required) Path to episodes.jsonl.gz
-  --output-name NAME     Subdir under Training_Output (default: worldmodel_v2)
-  --encoder PATH         Pretrained encoder.pth (optional but recommended)
-  --profile NAME         Hardware profile (default: rtx4070super)
-  --epochs N             Override profile default
-  -- <extra args>        Anything after -- is passed verbatim to train_worldmodel.py
-                         (e.g. --w-inverse-action 1.0 --freeze-encoder)
-EOF
-        return 0;;
-      *) die "unknown train option: $1";;
-    esac
-  done
-  [ -n "$data" ] || die "train requires --data"
-
-  local args=(
-    -m src.train_worldmodel
-    --project-root "$PROJECT_ROOT"
-    --data "$data"
-    --output-dir "${TRAIN_DIR}/${output_name}"
-    --hardware-profile "$profile"
-    --num-workers 1
-  )
-  [ -n "$encoder" ] && args+=(--pretrained-encoder "$encoder")
-  [ -n "$epochs" ] && args+=(--epochs "$epochs")
-  [ ${#extra[@]} -gt 0 ] && args+=("${extra[@]}")
-
-  ensure_dir "${TRAIN_DIR}/${output_name}/checkpoints"
-  log "data=$data output_name=$output_name encoder=${encoder:-none} profile=$profile epochs=${epochs:-default}"
-  spawn "train" "${output_name}" "${args[@]}"
-}
-
-# ---------- command: eval ----------
-
-cmd_eval() {
-  local checkpoint=""
-  local output_name=""
-  local games=""
-  local k=""; local h=""; local maxsteps=""
-  local extra=()
-  while [ $# -gt 0 ]; do
-    case "$1" in
-      --checkpoint) checkpoint="$2"; shift 2;;
-      --output-name) output_name="$2"; shift 2;;
-      --games) games="$2"; shift 2;;
-      --K|--rollouts-per-candidate) k="$2"; shift 2;;
-      --H|--rollout-horizon) h="$2"; shift 2;;
-      --max-steps) maxsteps="$2"; shift 2;;
-      --) shift; extra+=("$@"); break;;
-      --help|-h)
-        cat <<EOF
-eval — Step 7: Phase 3 sanity eval.
-
-Usage: bash scripts/run.sh eval --checkpoint <path> [options]
-
-  --checkpoint PATH        (required) Path to worldmodel best.pth
-  --output-name NAME       Eval JSON name (default: derived from checkpoint dir)
-  --games G1,G2,...        Games to eval (default: all 25)
-  --K N                    Rollouts per candidate (default: 1)
-  --H N                    Rollout horizon (default: 5)
-  --max-steps N            Max env actions per game (default: 192)
-  -- <extra args>          Anything after -- is passed verbatim to evaluate_worldmodel.py
-EOF
-        return 0;;
-      *) die "unknown eval option: $1";;
-    esac
-  done
-  [ -n "$checkpoint" ] || die "eval requires --checkpoint"
-  [ -f "$checkpoint" ] || die "checkpoint not found: $checkpoint"
-
-  if [ -z "$output_name" ]; then
-    output_name="eval_$(basename $(dirname $(dirname "$checkpoint")))"
-    [ -n "$games" ] && output_name="${output_name}_$(echo "$games" | tr ',' '_')"
-    [ -n "$k" ] && [ -n "$h" ] && output_name="${output_name}_K${k}H${h}"
-  fi
-  local output_path="$(dirname $(dirname "$checkpoint"))/${output_name}.json"
-
-  local args=(
-    -m src.evaluate_worldmodel
-    --project-root "$PROJECT_ROOT"
-    --checkpoint "$checkpoint"
-    --output "$output_path"
-  )
-  [ -n "$games" ] && args+=(--games "$games")
-  [ -n "$k" ] && args+=(--rollouts-per-candidate "$k")
-  [ -n "$h" ] && args+=(--rollout-horizon "$h")
-  [ -n "$maxsteps" ] && args+=(--max-steps "$maxsteps")
-  [ ${#extra[@]} -gt 0 ] && args+=("${extra[@]}")
-
-  ensure_dir "$(dirname "$output_path")"
-  log "checkpoint=$checkpoint games=${games:-all} K=${k:-1} H=${h:-5} -> $output_path"
-  spawn "eval" "${output_name}" "${args[@]}"
-}
-
 # ---------- command: status ----------
 
 cmd_status() {
   log "running pipeline processes:"
-  ps -ef | grep -E "(src\.collect_staged|src\.train_worldmodel|src\.pretrain_encoder|src\.evaluate_worldmodel)" | grep -v grep | head -20 || echo "(none running)"
+  ps -ef | grep -E "(src\.collect_staged|src\.collect|src\.train)" | grep -v grep | head -20 || echo "(none running)"
   echo
   log "memory:"
   free -h 2>/dev/null | head -2 || vm_stat | head -5
@@ -606,9 +443,6 @@ case "${1:-help}" in
   collect-quick) shift; cmd_collect_quick "$@";;
   collect-full) shift; cmd_collect_full "$@";;
   inspect) shift; cmd_inspect "$@";;
-  pretrain) shift; cmd_pretrain "$@";;
-  train) shift; cmd_train "$@";;
-  eval) shift; cmd_eval "$@";;
   status) shift; cmd_status "$@";;
   logs) shift; cmd_logs "$@";;
   help|--help|-h) shift; cmd_help "$@";;

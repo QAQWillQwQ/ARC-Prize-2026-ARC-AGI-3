@@ -14,6 +14,7 @@ from arcengine import GameAction
 
 from .agent import PolicyGuidedAgent
 from .collect import build_arcade, collect_episode_task, curriculum_key, format_duration
+from .replay_loader import build_game_prior as build_replay_prior
 from .common import (
     CandidateAction,
     append_jsonl_gz,
@@ -338,6 +339,55 @@ def run_probe_stage(
     return probe_priors
 
 
+def enrich_priors_with_replays(
+    project_root: Path,
+    probe_priors: Dict[str, Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    """Task #22: augment probe-derived game priors with replay-derived signals.
+
+    For each game with a replay JSONL under `environment_files/<id>/replays/`:
+    - REPLACE `coord_hint_points` with the replay's (probe gives 8 cap; replays
+      yield up to ~465 unique points). Replay coords are by-construction
+      successful click sites.
+    - ADD `state_graph_seed` for Track 2 to consume — pre-populates the
+      runtime state graph with known winning-trajectory edges.
+    - KEEP probe `action_scores` and `risky_actions` unchanged. Probe scores
+      measure "value of this action in early random rollouts" (heuristic
+      signal), which is more directly useful than replay frequency for
+      biasing the search agent's first few actions.
+
+    Games without a replay file pass through unchanged.
+    """
+    n_enriched = 0
+    n_total_seed_states = 0
+    n_total_coord_hints = 0
+    for game_id in list(probe_priors.keys()):
+        replay_prior = build_replay_prior(project_root, game_id)
+        if replay_prior is None:
+            continue
+        merged = dict(probe_priors[game_id])
+        replay_coords = replay_prior.get("coord_hint_points") or []
+        replay_seed = replay_prior.get("state_graph_seed") or {}
+        if replay_coords:
+            # Convert tuples to list-of-lists for JSON serialization parity
+            # with how probe priors structure their coord_hint_points.
+            merged["coord_hint_points"] = [
+                [int(p[0]), int(p[1])] for p in replay_coords
+            ]
+            n_total_coord_hints += len(replay_coords)
+        if replay_seed:
+            merged["state_graph_seed"] = replay_seed
+            n_total_seed_states += len(replay_seed)
+        probe_priors[game_id] = merged
+        n_enriched += 1
+    print(
+        "[stage] enriched %d/%d game priors with replays (added %d coord hints, %d state-graph seed states)"
+        % (n_enriched, len(probe_priors), n_total_coord_hints, n_total_seed_states),
+        flush=True,
+    )
+    return probe_priors
+
+
 def progress_scalar(game_id: str, game_stats: Dict[str, Dict[str, Any]]) -> float:
     stats = ensure_game_stats(game_stats, game_id)
     return (
@@ -614,6 +664,11 @@ def main() -> None:
         ordered_games=requested_games,
         seeds=seeds,
     )
+    # Task #22: enrich probe priors with ground-truth replay-derived signals.
+    # No-op for games without a replay file; otherwise adds state_graph_seed
+    # and replaces the probe's 8-coord coord_hint_points with the replay's
+    # full set of successful ACTION6 click sites.
+    game_priors = enrich_priors_with_replays(project_root, game_priors)
 
     for stage_index, stage in enumerate(stages, start=1):
         selected_games = select_games(requested_games, metadata_map, game_stats, game_priors, stage)

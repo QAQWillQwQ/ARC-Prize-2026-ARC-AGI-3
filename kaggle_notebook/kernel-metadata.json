@@ -1,0 +1,14 @@
+{
+  "id": "jihangli1121/arc-agi-3-warmstart-v1",
+  "title": "ARC AGI 3 Warmstart v1",
+  "code_file": "kaggle_submission.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "false",
+  "dataset_sources": ["jihangli1121/arc-agi-3-replays-v1"],
+  "competition_sources": ["arc-prize-2026-arc-agi-3"],
+  "kernel_sources": [],
+  "model_sources": []
+}

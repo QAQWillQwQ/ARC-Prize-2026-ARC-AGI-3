@@ -14,3 +14,8 @@ Gif_Demo/
 Git_Demo/
 .idea/
 .claude/
+
+# Per-game replay JSONLs (~600 MB total). Ground-truth winning playthroughs
+# used as BC training data, exploration priors, and coord_hint sources.
+# Not committed: large + may not be redistributable under ARC AGI 3 terms.
+environment_files/*/replays/

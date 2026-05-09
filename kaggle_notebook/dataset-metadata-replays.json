@@ -1,0 +1,9 @@
+{
+  "title": "ARC AGI 3 GT Replays",
+  "id": "jihangli1121/arc-agi-3-replays-v1",
+  "licenses": [{"name": "CC-BY-4.0"}],
+  "subtitle": "Public ground-truth replays for the 25 ARC AGI 3 public games",
+  "description": "Per-game GT replay JSONLs scraped from the public ARC AGI 3 web app at https://three.arcprize.org/. Layout: environment_files/<game_id>/replays/*.json. One replay per game, ~150-1500 actions each. Includes RESET markers (action_input.id=0) and GAME_OVER state transitions — i.e., the full human exploration arc, not just winning trajectories. Compatible with the ARC AGI 3 framework's gateway env (action_input.id ∈ {0..7}).",
+  "keywords": ["arc-agi", "arc-agi-3", "agent", "replay"],
+  "collaborators": []
+}

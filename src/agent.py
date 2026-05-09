@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import random
+import time
 from collections import deque
 from dataclasses import dataclass
-import random
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
+import numpy as np
 import torch
 from arcengine import GameAction, GameState
 
@@ -88,6 +90,16 @@ class PolicyGuidedAgent:
         coord_budget: int = 20,
         random_seed: Optional[int] = None,
         game_prior: Optional[Dict[str, Any]] = None,
+        max_episode_seconds: float = 600.0,
+        # Phase α.5.2: ActionEffectDictionary lookup bonus. Built from GT
+        # replay transitions; provides per-candidate (similarity * (mean_delta
+        # /256 + 2*level_prob)) signal so the search prefers actions whose
+        # historical effect on similar frames was large and led to level
+        # progress. effect_dict_game_id, when set, restricts lookups to
+        # known-public games only.
+        effect_dict: Optional[Any] = None,
+        effect_bonus_weight: float = 0.3,
+        effect_dict_game_id: Optional[str] = None,
     ) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,6 +115,14 @@ class PolicyGuidedAgent:
         self.stall_steps = stall_steps
         self.reset_limit = reset_limit
         self.coord_budget = coord_budget
+        # Task #19: per-episode wall-clock timeout. Defends against the
+        # rescue_hard worker freeze observed on Openlab 2026-05-08, where 10
+        # workers stuck for 25+ minutes producing no output. Likely cause
+        # is an env.step() deadlock in arcengine on a specific game state
+        # OR a heuristic interaction we haven't reproduced. Either way, a
+        # hard wall budget per episode prevents an entire collect from being
+        # held up by one bad seed.
+        self.max_episode_seconds = float(max_episode_seconds)
         self.history_frames: Deque[List[List[int]]] = deque(maxlen=self.history_size)
         self.last_action_id: Optional[int] = None
         self.steps_since_progress = 0
@@ -140,8 +160,36 @@ class PolicyGuidedAgent:
         # unexplored (state, action) pairs. Per arxiv:2512.24156, the training-
         # free 3rd-place ARC AGI 3 preview agent uses this pattern + BFS to
         # untested actions to beat frontier LLMs.
+        # Task #20: optionally pre-populate the graph from a replay-derived
+        # seed in game_prior. When present, the search agent starts the
+        # episode already knowing the (state, action) -> next_state edges
+        # observed in a known winning playthrough — it avoids reproducing
+        # them and instead biases toward the still-novel actions.
+        seed_graph_raw = self.game_prior.get("state_graph_seed") or {}
         self.state_graph: Dict[str, Dict[Tuple[int, int, int], str]] = {}
+        if isinstance(seed_graph_raw, dict):
+            for src_hash, edges in seed_graph_raw.items():
+                if not isinstance(src_hash, str) or not isinstance(edges, dict):
+                    continue
+                normalized: Dict[Tuple[int, int, int], str] = {}
+                for k, v in edges.items():
+                    if not isinstance(v, str):
+                        continue
+                    if isinstance(k, tuple) and len(k) == 3:
+                        normalized[(int(k[0]), int(k[1]), int(k[2]))] = v
+                    elif isinstance(k, list) and len(k) == 3:
+                        normalized[(int(k[0]), int(k[1]), int(k[2]))] = v
+                if normalized:
+                    self.state_graph[src_hash] = normalized
         self._current_frame_hash: Optional[str] = None
+        # Track 1.6: set per-step in rank_candidates from available_actions.
+        # Defaults to False so unit tests that call _recent_repeat_penalty
+        # directly (without ranking first) get the click-game penalty path.
+        self._is_keyboard_only: bool = False
+        # Phase α.5.2: retrieval-dictionary bonus state.
+        self.effect_dict: Optional[Any] = effect_dict
+        self.effect_bonus_weight: float = float(effect_bonus_weight)
+        self.effect_dict_game_id: Optional[str] = effect_dict_game_id
 
     def reset_memory(self, initial_frame: Sequence[Sequence[int]]) -> None:
         self.history_frames.clear()
@@ -192,8 +240,33 @@ class PolicyGuidedAgent:
         history = list(self.action_history)
         penalty = 0.0
 
+        # Opposite-action ping-pong (left↔right, up↔down): always counted.
+        # Even during warmup or on keyboard games, ABAB patterns waste the
+        # action budget without exploring new state.
         if self.last_action_id is not None and OPPOSITE_ACTION_IDS.get(self.last_action_id) == action_id:
             penalty += 0.6 + min(self.steps_since_progress * 0.02, 0.4)
+
+        # Track 1.5: exploration warmup. Skip same-tail / template penalties
+        # entirely for the first 6 actions of an episode. Keyboard games may
+        # need 2-3 consecutive same-direction presses before any visible delta
+        # occurs — Track 1's productivity gate (`zero_delta_streak == 0`) only
+        # fires AFTER the first productive step. Without warmup, the agent
+        # never gets to that first productive step because each repeated
+        # press accumulates penalty before the env's next-frame finally
+        # registers movement. wm_full_v1_openlab and wm_full_v2_openlab both
+        # showed 0/4 on keyboard-only games (g50t/ls20/tr87/wa30); this
+        # warmup unlocks the early exploration window.
+        warmup_active = len(history) < 6
+        if warmup_active:
+            return penalty
+
+        # Track 1.6: keyboard-only softening. When ACTION6 is unavailable
+        # this episode, the agent has fewer escape routes from a wrong
+        # direction than in click-enabled games, and the same-tail / template
+        # penalties become disproportionately punishing. Apply a 0.5x scaling
+        # to those terms (opposite-action and zero_delta_streak penalties
+        # remain at full strength so real loops still get caught).
+        kb_softening = 0.5 if getattr(self, "_is_keyboard_only", False) else 1.0
 
         same_tail = 0
         for existing in reversed(history):
@@ -211,7 +284,7 @@ class PolicyGuidedAgent:
             # transition produced visible change, so the agent is making progress.
             last_was_productive = self.zero_delta_streak == 0
             if not last_was_productive:
-                penalty += min(0.18 * float(same_tail - 1), 0.8)
+                penalty += min(0.18 * float(same_tail - 1), 0.8) * kb_softening
                 if action_id == 6:
                     penalty += min(0.12 * float(same_tail - 1), 0.9)
             elif action_id == 6:
@@ -239,6 +312,8 @@ class PolicyGuidedAgent:
             # actions, this is legitimate navigation — kill the template penalty.
             # For ACTION6, keep ~30% (clicks at same coord rarely stay productive).
             template_pen *= 0.0 if action_id != 6 else 0.3
+        # Track 1.6: also halve the template penalty for keyboard-only games
+        template_pen *= kb_softening
         penalty += template_pen
 
         if self.zero_delta_streak >= 2 and history[-1] == action_id:
@@ -368,6 +443,25 @@ class PolicyGuidedAgent:
         available_set = set(int(action) for action in available_actions)
         # Track 2: anchor the current-state hash for novelty lookups in this step.
         self._current_frame_hash = frame_hash(frame)
+        # Track 1.6: detect keyboard-only games (ACTION6 unavailable). Read by
+        # _recent_repeat_penalty to apply 0.5x softening on same-tail / template
+        # terms so the agent has more leeway with directional pressing.
+        self._is_keyboard_only = 6 not in available_set
+
+        # Phase α.5.2: precompute the normalized 256-dim feature key for the
+        # current frame once per ranking call. The retrieval-dictionary lookup
+        # then reuses it across all candidates (~22 per step), avoiding the
+        # cost of re-hashing the frame for every (action_id, x, y).
+        effect_query: Optional[np.ndarray] = None
+        if self.effect_dict is not None and self.effect_bonus_weight != 0.0:
+            from .action_effect_dict import compute_feature_key
+            try:
+                feat = compute_feature_key(frame)
+                feat_norm = float(np.linalg.norm(feat))
+                if feat_norm >= 1e-8:
+                    effect_query = (feat / feat_norm).astype(np.float32)
+            except Exception:
+                effect_query = None
 
         for action_id in ACTION_IDS:
             if action_id not in available_set:
@@ -407,6 +501,9 @@ class PolicyGuidedAgent:
                     score -= self._recent_repeat_penalty(action_id)
                     score -= self._coord_repeat_penalty((x, y))
                     score -= self._dead_click_penalty()
+                    score += self._effect_dict_bonus(
+                        frame, int(action_id), int(x), int(y), effect_query
+                    )
                     if output is None:
                         score += self.rng.uniform(0.0, 0.05)
                     candidates.append(
@@ -430,6 +527,9 @@ class PolicyGuidedAgent:
                     score -= 0.1
                 score += self._state_graph_novelty_bonus(action_id, 0, 0)
                 score -= self._recent_repeat_penalty(action_id)
+                score += self._effect_dict_bonus(
+                    frame, int(action_id), 0, 0, effect_query
+                )
                 if output is None:
                     score += self.rng.uniform(0.0, 0.05)
                 candidates.append(
@@ -443,6 +543,48 @@ class PolicyGuidedAgent:
 
         candidates.sort(key=lambda item: item.score, reverse=True)
         return candidates
+
+    def _effect_dict_bonus(
+        self,
+        frame: Sequence[Sequence[int]],
+        action_id: int,
+        x: int,
+        y: int,
+        precomputed_query: Optional[np.ndarray],
+    ) -> float:
+        """Phase α.5.2: retrieval-dictionary bonus for one (action, x, y).
+
+        Returns 0.0 when no dictionary is loaded, the bonus weight is zero, or
+        the lookup found no matches. Otherwise returns
+
+            effect_bonus_weight * similarity * (mean_delta/256.0 + 2.0 * level_prob)
+
+        which combines visual-frame similarity, the historical pixel-change
+        magnitude this action produced on similar frames, and the historical
+        probability that the action led to a level-progress event.
+        """
+        if self.effect_dict is None or self.effect_bonus_weight == 0.0:
+            return 0.0
+        try:
+            result = self.effect_dict.lookup(
+                frame=frame,
+                action_id=action_id,
+                x=x,
+                y=y,
+                k=5,
+                game_id=self.effect_dict_game_id,
+                precomputed_query=precomputed_query,
+            )
+        except Exception:
+            return 0.0
+        if result.get("n_matches", 0) <= 0:
+            return 0.0
+        similarity = float(result.get("similarity", 0.0))
+        mean_delta = float(result.get("mean_delta", 0.0))
+        level_prob = float(result.get("level_prob", 0.0))
+        if similarity <= 0.0:
+            return 0.0
+        return self.effect_bonus_weight * similarity * (mean_delta / 256.0 + 2.0 * level_prob)
 
     def choose_action(
         self,
@@ -593,8 +735,22 @@ class PolicyGuidedAgent:
         self.reset_memory(frame)
         resets_used = 0
         transitions: List[Dict[str, Any]] = []
+        # Task #19: wall-clock budget for the whole episode. Catches cases
+        # where env.step() deadlocks or our heuristic stack accidentally
+        # loops forever — the play_env breaks out of the step loop and the
+        # collector treats the partial trajectory as a NOT_FINISHED episode.
+        episode_start_time = time.time()
 
         for step_index in range(self.max_steps):
+            if (time.time() - episode_start_time) >= self.max_episode_seconds:
+                # Wall-clock timeout. Log once per occurrence so collect_staged
+                # captures the seed/game in the run log for follow-up.
+                print(
+                    "[agent] %s episode timed out after %.1fs (max=%.1fs) at step %d — aborting"
+                    % (game_id, time.time() - episode_start_time, self.max_episode_seconds, step_index),
+                    flush=True,
+                )
+                break
             state_name = raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
             if state_name == GameState.WIN.name:
                 break
