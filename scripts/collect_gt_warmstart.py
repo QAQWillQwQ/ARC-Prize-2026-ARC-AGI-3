@@ -77,17 +77,22 @@ from src.common import (  # noqa: E402
 
 
 # ============================================================================
-# Per-worker reused Arcade (memory fix — prevents 12,000+ leaked scorecards).
+# Per-worker cached Arcade + env instances (the real memory fix).
 # ============================================================================
-# Each `arc.make()` call instantiates a new scorecard and reloads game-class
-# state. Without reuse, 12,425 tasks → 12,425 new Arcades → 30-50 GB leaked.
-# We create ONE Arcade per worker via the initializer, reuse across tasks.
+# Pre-v: each task called `arc.make(game_id)` → fresh env + fresh game class.
+# Across 12,425 tasks that's 12,425 leaked envs (the user's 50 GB blowup).
+#
+# Now: ONE Arcade per worker, plus a per-worker dict of {short_id: env} that
+# caches up to 25 envs. Each task fetches the cached env and calls env.reset()
+# instead of re-creating. The 25 envs become a fixed working set per worker.
+# Memory growth across tasks: ~zero.
 _WORKER_ARC: Optional[Arcade] = None
+_WORKER_ENVS: Dict[str, Any] = {}
 
 
 def _init_worker(project_root_str: str, recordings_dir_str: str, priors_path_str: Optional[str]) -> None:
     """ProcessPoolExecutor initializer. Creates one Arcade per worker."""
-    global _WORKER_ARC
+    global _WORKER_ARC, _WORKER_ENVS
     if priors_path_str:
         import os
         os.environ.setdefault("ARC_PRIORS_PATH", priors_path_str)
@@ -96,6 +101,23 @@ def _init_worker(project_root_str: str, recordings_dir_str: str, priors_path_str
         environments_dir=str(Path(project_root_str) / "environment_files"),
         recordings_dir=str(recordings_dir_str),
     )
+    _WORKER_ENVS = {}
+
+
+def _get_or_make_env(arc: Arcade, full_id: str) -> Any:
+    """Return a cached env for `full_id`, creating + caching it on first use.
+
+    For repeat calls within the same worker, returns the SAME env instance
+    (after env.reset() — see collect_one). Across all worker tasks, a worker
+    holds at most 25 envs (one per game), no matter how many tasks run.
+    """
+    global _WORKER_ENVS
+    env = _WORKER_ENVS.get(full_id)
+    if env is None:
+        env = arc.make(full_id)
+        if env is not None:
+            _WORKER_ENVS[full_id] = env
+    return env
 
 
 # Phase-B strategies sourced from kaggle_notebook/my_agent.py:
@@ -491,10 +513,20 @@ def collect_one(
             environments_dir=str(project_root / "environment_files"),
             recordings_dir=str(recordings_dir),
         )
-    env = arc.make(full_id)
+    # Fetch or create the cached env for this game. The cached env is reused
+    # across all tasks for the same game_id within this worker — only 25 envs
+    # max per worker no matter how many tasks. Memory growth across tasks: ~0.
+    env = _get_or_make_env(arc, full_id)
     if env is None:
         return {"game_id": full_id, "error": "env_make_returned_None"}
-    raw_obs = env.observation_space
+    # Reset to a clean initial state. For a freshly-made env this is a no-op;
+    # for a cached env it restarts the game so the next task starts cleanly.
+    try:
+        raw_obs = env.reset()
+    except Exception:
+        raw_obs = env.observation_space
+    if raw_obs is None:
+        raw_obs = env.observation_space
     if raw_obs is None:
         return {"game_id": full_id, "error": "no_observation_space"}
 
