@@ -76,6 +76,28 @@ from src.common import (  # noqa: E402
 )
 
 
+# ============================================================================
+# Per-worker reused Arcade (memory fix — prevents 12,000+ leaked scorecards).
+# ============================================================================
+# Each `arc.make()` call instantiates a new scorecard and reloads game-class
+# state. Without reuse, 12,425 tasks → 12,425 new Arcades → 30-50 GB leaked.
+# We create ONE Arcade per worker via the initializer, reuse across tasks.
+_WORKER_ARC: Optional[Arcade] = None
+
+
+def _init_worker(project_root_str: str, recordings_dir_str: str, priors_path_str: Optional[str]) -> None:
+    """ProcessPoolExecutor initializer. Creates one Arcade per worker."""
+    global _WORKER_ARC
+    if priors_path_str:
+        import os
+        os.environ.setdefault("ARC_PRIORS_PATH", priors_path_str)
+    _WORKER_ARC = Arcade(
+        operation_mode=OperationMode.OFFLINE,
+        environments_dir=str(Path(project_root_str) / "environment_files"),
+        recordings_dir=str(recordings_dir_str),
+    )
+
+
 # Phase-B strategies sourced from kaggle_notebook/my_agent.py:
 ALL_STRATEGIES: Tuple[str, ...] = (
     "random_full",
@@ -460,11 +482,15 @@ def collect_one(
     """Run one episode and return the payload."""
     seed_everything(seed)
     rng = pyrandom.Random(seed)
-    arc = Arcade(
-        operation_mode=OperationMode.OFFLINE,
-        environments_dir=str(project_root / "environment_files"),
-        recordings_dir=str(recordings_dir),
-    )
+    # Reuse the per-worker Arcade (set by _init_worker). Falls back to a fresh
+    # Arcade if running outside ProcessPoolExecutor (e.g., direct invocation).
+    arc = _WORKER_ARC
+    if arc is None:
+        arc = Arcade(
+            operation_mode=OperationMode.OFFLINE,
+            environments_dir=str(project_root / "environment_files"),
+            recordings_dir=str(recordings_dir),
+        )
     env = arc.make(full_id)
     if env is None:
         return {"game_id": full_id, "error": "env_make_returned_None"}
@@ -629,7 +655,9 @@ def parse_args() -> argparse.Namespace:
                    default="random_full,keyboard_only,click_grid,directional_sustained,edge_sweep,color_targeted,action_id_sweep",
                    help="Comma-separated Phase B strategies (from MyAgent.STRATEGIES). "
                         "Forced per task during Phase B. Default: all 7.")
-    p.add_argument("--max-steps", type=int, default=3000)
+    p.add_argument("--max-steps", type=int, default=1500,
+                   help="Per-task action budget. 1500 covers the longest GT replay (wa30=1565). "
+                        "Higher costs memory linearly per worker. Default: 1500.")
     p.add_argument("--workers", type=int, default=8)
     return p.parse_args()
 
@@ -720,7 +748,31 @@ def main() -> int:
         flush=True,
     )
 
-    with ProcessPoolExecutor(max_workers=max(1, int(args.workers))) as pool:
+    # Per-worker init: create one Arcade per worker (reused across tasks),
+    # pin ARC_PRIORS_PATH so MyAgent loads priors. Big memory win vs creating
+    # an Arcade per task.
+    priors_for_init = (
+        str(project_root / "Local_Output" / "per_game_priors.json")
+        if (project_root / "Local_Output" / "per_game_priors.json").is_file()
+        else None
+    )
+    pool_kwargs: Dict[str, Any] = {
+        "max_workers": max(1, int(args.workers)),
+        "initializer": _init_worker,
+        "initargs": (str(project_root), str(recordings_dir), priors_for_init),
+    }
+    # max_tasks_per_child=50 (Python 3.11+): worker recycled every 50 tasks
+    # to bound any leaked state in arc_agi internals. 50 is gentle (vs 5 which
+    # caused freezes) — it gives workers enough lifetime to amortize startup
+    # but bounds the memory footprint.
+    try:
+        import inspect as _insp
+        if "max_tasks_per_child" in _insp.signature(ProcessPoolExecutor).parameters:
+            pool_kwargs["max_tasks_per_child"] = 50
+    except Exception:
+        pass
+
+    with ProcessPoolExecutor(**pool_kwargs) as pool:
         futures = {
             pool.submit(
                 collect_one,

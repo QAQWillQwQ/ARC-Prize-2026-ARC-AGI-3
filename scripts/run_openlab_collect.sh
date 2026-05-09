@@ -39,14 +39,14 @@ mkdir -p "$LOG_DIR" "$COLLECT_DIR"
 # Memory-conservative defaults: WORKERS=8 keeps total RAM under ~10 GB at the
 # default max_steps. Bump --workers if your box has the RAM and process budget.
 # Past blowups: 96 workers × 3000 max_steps hit ~300 GB RSS on Openlab.
-WORKERS=8
-MAX_STEPS=1500
+WORKERS=16
+MAX_STEPS=1600
 OUTPUT_NAME="staged_v2_gt"
 DEVIATIONS="0,25,50,75,100"
-SEEDS=4
+SEEDS=16
 STRATEGIES="random_full,keyboard_only,click_grid,directional_sustained,edge_sweep,color_targeted,action_id_sweep"
 PERTURB_RATES="0.05,0.10,0.15"
-PERTURB_SEEDS=4
+PERTURB_SEEDS=16
 GAMES=""
 SMOKE=0
 
