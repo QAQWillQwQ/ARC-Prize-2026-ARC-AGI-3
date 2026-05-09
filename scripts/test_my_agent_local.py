@@ -273,7 +273,7 @@ def run_game(arc: Arcade, game_id: str, *, max_steps: int = 192,
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--games", type=str, default="sp80,ar25,lp85,cn04,cd82,sb26,ft09,r11l")
-    parser.add_argument("--max-steps", type=int, default=192)
+    parser.add_argument("--max-steps", type=int, default=3000)
     parser.add_argument("--output", type=str, default=str(ROOT / "Local_Output" / "Logs" / "test_my_agent_local.json"))
     parser.add_argument(
         "--no-replays",

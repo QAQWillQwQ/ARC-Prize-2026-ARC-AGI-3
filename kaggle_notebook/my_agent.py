@@ -73,7 +73,15 @@ def _normalize_action_id(raw: Any) -> int:
 
 
 def _load_replay_actions(short_game_id: str) -> List[Dict[str, Any]]:
-    """Returns a list of {'type': 'reset' | 'action', ...} entries."""
+    """Returns a list of {'type': 'reset' | 'action', ...} entries — full replay.
+
+    The full GT recording (all attempts including failures) is preserved. The
+    Phase A loop in MyAgent.choose_action handles env state transitions: when
+    env enters GAME_OVER it issues RESET and continues the replay from the
+    current cursor (skipping any GT reset markers that may follow). This way
+    the agent walks every attempt the human made, accumulating levels across
+    the cumulative sequence.
+    """
     replay_dir = REPLAY_BASE_DIR / short_game_id / 'replays'
     if not replay_dir.is_dir():
         return []
@@ -326,6 +334,31 @@ CLICK_GRID_POINTS: Tuple[Tuple[int, int], ...] = (
 )
 
 
+def _build_edge_sweep_points() -> List[Tuple[int, int]]:
+    """Perimeter points (clockwise from top-left) + 4x4 interior grid.
+
+    Used by the edge_sweep Phase B strategy. ~40 points; cycles through them
+    deterministically. Different from CLICK_GRID_POINTS which has 13 'safe'
+    pre-known click candidates.
+    """
+    points: List[Tuple[int, int]] = []
+    for x in range(4, 61, 8):
+        points.append((x, 2))
+    for y in range(4, 61, 8):
+        points.append((61, y))
+    for x in range(60, 3, -8):
+        points.append((x, 61))
+    for y in range(60, 3, -8):
+        points.append((2, y))
+    for x in (12, 24, 36, 48):
+        for y in (12, 24, 36, 48):
+            points.append((x, y))
+    return points
+
+
+EDGE_SWEEP_POINTS: Tuple[Tuple[int, int], ...] = tuple(_build_edge_sweep_points())
+
+
 # ---------------------- main agent ----------------------
 
 
@@ -340,6 +373,9 @@ class MyAgent(Agent):
         'keyboard_only',
         'click_grid',
         'directional_sustained',
+        'edge_sweep',
+        'color_targeted',
+        'action_id_sweep',
     )
 
     # Map archetype string (from per_game_priors) -> starting strategy_idx.
@@ -382,6 +418,18 @@ class MyAgent(Agent):
         # x_bin/y_bin are 0..7 (8x8 spatial bins, each = 8x8 pixels).
         self._action_effects: Dict[Tuple[int, int, int], Tuple[int, float]] = {}
         self._last_returned_action: Optional[GameAction] = None
+
+        # v4 (improvements 1-5): online learning + freeze detection +
+        # cross-attempt strategy memory + new-strategy state.
+        self._frozen_streak: int = 0                          # consecutive zero-delta steps
+        self._strategy_levels: Dict[str, int] = {}            # per-strategy levels cleared this game
+        self._last_levels_seen: int = 0                       # for level-delta detection
+        self._edge_sweep_idx: int = 0                         # cursor into EDGE_SWEEP_POINTS
+        self._color_targeted_state: Dict[int, List[Tuple[int, int]]] = {}   # color -> remaining points
+        self._color_targeted_color_order: List[int] = []      # iteration order across colors
+        self._color_targeted_color_idx: int = 0
+        self._action_id_sweep_idx: int = 0                    # which available action we're cycling on
+        self._action_id_sweep_count: int = 0                  # repeats so far for current action
 
         prior_summary = (
             f"archetype={archetype} click_ratio={self._game_prior.get('click_ratio', '?')}"
@@ -580,7 +628,11 @@ class MyAgent(Agent):
 
     def _record_last_action_effect(self, frames: List[FrameData], latest_frame: FrameData) -> None:
         """If we have a previous frame and a previously-returned action,
-        compute frame_delta and update the online action-effects map."""
+        compute frame_delta and update the online action-effects map.
+
+        Also bumps the freeze streak (consecutive zero-delta steps) used by
+        choose_action's freeze-detection branch.
+        """
         if self._last_returned_action is None or len(frames) < 2:
             return
         prev = _flatten_frame(getattr(frames[-2], 'frame', None))
@@ -588,6 +640,11 @@ class MyAgent(Agent):
         if prev is None or cur is None:
             return
         delta = _frame_delta(prev, cur)
+        # v4 freeze detection: track consecutive zero-delta steps.
+        if delta == 0:
+            self._frozen_streak += 1
+        else:
+            self._frozen_streak = 0
         try:
             aid = int(self._last_returned_action.value if hasattr(self._last_returned_action, 'value') else 0)
         except Exception:
@@ -606,6 +663,26 @@ class MyAgent(Agent):
         n_new = c + 1
         m_new = m + (delta - m) / n_new
         self._action_effects[key] = (n_new, m_new)
+
+    def _score_action_candidate(self, action_id: int, x: int = 0, y: int = 0) -> float:
+        """Online action-effect score for a candidate. Used by click_grid and
+        directional_sustained re-rankings.
+
+        Score in [0.1, 1.0]:
+          - 1.0  → never tried (explore)
+          - 0.1  → tried but mean delta < 1 pixel (known dead — strongly avoid)
+          - else → mean_delta normalized, capped at 1.0
+        """
+        if int(action_id) == 6:
+            key = (6, int(x) // 8, int(y) // 8)
+        else:
+            key = (int(action_id), 0, 0)
+        count, mean_delta = self._action_effects.get(key, (0, 0.0))
+        if count == 0:
+            return 1.0
+        if mean_delta < 1.0:
+            return 0.1
+        return min(1.0, mean_delta / 10.0)
 
     # ---------------------- strategy implementations ----------------------
 
@@ -632,7 +709,24 @@ class MyAgent(Agent):
             self._build_click_grid_from_saliency(latest_frame)
         if not self._click_grid_points:
             self._click_grid_points = list(CLICK_GRID_POINTS)
-        x, y = self._click_grid_points[self._click_grid_idx % len(self._click_grid_points)]
+
+        # v4 improvement #1: re-rank click_grid_points by online action-effect
+        # score, then pick from top-K via weighted random. Falls back to the
+        # original sequential cursor when scoring is uniform (early in the
+        # episode, before any data is gathered).
+        scored = [(p, self._score_action_candidate(6, p[0], p[1])) for p in self._click_grid_points]
+        top_k = sorted(scored, key=lambda kv: -kv[1])[:5]
+        if top_k and any(s > 0 for _, s in top_k):
+            weights = [s for _, s in top_k]
+            try:
+                chosen = self._rng.choices([p for p, _ in top_k], weights=weights, k=1)[0]
+            except Exception:
+                chosen = top_k[0][0]
+            x, y = chosen
+            source = 'top_k'
+        else:
+            x, y = self._click_grid_points[self._click_grid_idx % len(self._click_grid_points)]
+            source = 'cursor'
         self._click_grid_idx += 1
         try:
             action = GameAction.ACTION6
@@ -644,6 +738,7 @@ class MyAgent(Agent):
             'strategy': 'click_grid',
             'point': [int(x), int(y)],
             'idx': self._click_grid_idx - 1,
+            'source': source,
         }
         return action
 
@@ -652,29 +747,30 @@ class MyAgent(Agent):
         if not available:
             return _safe_random_action(self._rng, latest_frame)
         if self._sustained_dir is None or self._sustained_remaining <= 0 or self._sustained_dir not in available:
-            # v3: weighted by repeat_kept_actions from prior, when known.
+            # v4 improvement #5: combine prior weight (repeat_kept_actions, normalized)
+            # with online action-effect score. Online weight dominates after a few
+            # samples are collected for the action.
             repeat_kept = self._game_prior.get('repeat_kept_actions', {})
-            chosen: Optional[int] = None
-            if isinstance(repeat_kept, dict) and repeat_kept:
-                weights: List[Tuple[int, float]] = []
-                for k, v in repeat_kept.items():
-                    try:
-                        aid = int(k)
-                    except Exception:
-                        continue
-                    if aid in available and 1 <= aid <= 5:
-                        weights.append((aid, float(v)))
-                if weights:
-                    total = sum(w for _, w in weights)
-                    pick = self._rng.uniform(0, total)
-                    acc = 0.0
-                    chosen = weights[0][0]
-                    for aid, w in weights:
-                        acc += w
-                        if pick <= acc:
-                            chosen = aid
-                            break
-            if chosen is None:
+            if isinstance(repeat_kept, dict):
+                prior_max = max((float(v) for v in repeat_kept.values()), default=1.0) or 1.0
+            else:
+                prior_max = 1.0
+                repeat_kept = {}
+
+            weighted: List[Tuple[int, float]] = []
+            for aid in available:
+                prior_w = float(repeat_kept.get(str(aid), 0.0)) / prior_max
+                online_w = self._score_action_candidate(aid)
+                weighted.append((aid, prior_w * 0.5 + online_w * 1.0))
+
+            if weighted and any(w > 0 for _, w in weighted):
+                actions = [aid for aid, _ in weighted]
+                weights = [w for _, w in weighted]
+                try:
+                    chosen = self._rng.choices(actions, weights=weights, k=1)[0]
+                except Exception:
+                    chosen = self._rng.choice(actions)
+            else:
                 chosen = self._rng.choice(available)
             self._sustained_dir = int(chosen)
             self._sustained_remaining = self._rng.randint(3, 5)
@@ -692,6 +788,162 @@ class MyAgent(Agent):
         }
         return action
 
+    def _strategy_edge_sweep(self, latest_frame: FrameData) -> GameAction:
+        """v4 strategy: cycle perimeter points + 4x4 interior grid for ACTION6.
+
+        Useful for games where the goal is on the screen edge or where boundary
+        clicks reveal hidden state. Different from click_grid (saliency-based);
+        edge_sweep doesn't depend on visual rare-color content.
+        """
+        available = _available_action_ids(latest_frame)
+        if 6 not in available:
+            return self._strategy_keyboard_only(latest_frame)
+        x, y = EDGE_SWEEP_POINTS[self._edge_sweep_idx % len(EDGE_SWEEP_POINTS)]
+        self._edge_sweep_idx += 1
+        try:
+            action = GameAction.ACTION6
+            action.set_data({'x': int(x), 'y': int(y)})
+        except Exception:
+            return _safe_random_action(self._rng, latest_frame)
+        action.reasoning = {
+            'phase': 'fallback',
+            'strategy': 'edge_sweep',
+            'point': [int(x), int(y)],
+            'idx': self._edge_sweep_idx - 1,
+        }
+        return action
+
+    def _extract_color_targeted_points(
+        self, frame: Sequence[Sequence[int]]
+    ) -> Dict[int, List[Tuple[int, int]]]:
+        """Per-rare-color: centroid + bbox corners. Returns dict color → points list."""
+        rows = len(frame) if frame is not None and len(frame) > 0 else 0
+        cols = len(frame[0]) if rows else 0
+        if rows < 1 or cols < 1:
+            return {}
+        color_pixels: Dict[int, List[Tuple[int, int]]] = {}
+        for y, row in enumerate(frame):
+            for x, c in enumerate(row):
+                try:
+                    ci = int(c)
+                except (TypeError, ValueError):
+                    # Non-scalar (e.g. numpy ndarray, nested list) — try .item().
+                    try:
+                        ci = int(c.item()) if hasattr(c, "item") else 0
+                    except Exception:
+                        continue
+                if ci == 0:
+                    continue
+                color_pixels.setdefault(ci, []).append((x, y))
+        rare = {c: pts for c, pts in color_pixels.items() if 1 <= len(pts) <= 200}
+        out: Dict[int, List[Tuple[int, int]]] = {}
+        for color, pts in sorted(rare.items(), key=lambda kv: len(kv[1]))[:6]:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            cx = int(sum(xs) / len(xs))
+            cy = int(sum(ys) / len(ys))
+            per_color: List[Tuple[int, int]] = [(cx, cy)]
+            if len(pts) >= 3:
+                per_color.extend([
+                    (min(xs), min(ys)),
+                    (max(xs), min(ys)),
+                    (min(xs), max(ys)),
+                    (max(xs), max(ys)),
+                ])
+            out[color] = per_color
+        return out
+
+    def _strategy_color_targeted(self, latest_frame: FrameData) -> GameAction:
+        """v4 strategy: per-rare-color exhaustive click cycle.
+
+        Different from click_grid (which mixes all rare colors): this strategy
+        clicks all points of color A first (centroid + 4 bbox corners), then
+        moves to color B, etc. Lets the agent test "is this color the goal?"
+        as a discrete hypothesis per color.
+        """
+        available = _available_action_ids(latest_frame)
+        if 6 not in available:
+            return self._strategy_keyboard_only(latest_frame)
+
+        # Build per-color point queues lazily, and rebuild after a full pass.
+        if not self._color_targeted_color_order:
+            frame = _flatten_frame(getattr(latest_frame, 'frame', None))
+            if frame is None:
+                return _safe_random_action(self._rng, latest_frame)
+            color_pts = self._extract_color_targeted_points(frame)
+            if not color_pts:
+                return _safe_random_action(self._rng, latest_frame)
+            self._color_targeted_state = {c: list(pts) for c, pts in color_pts.items()}
+            self._color_targeted_color_order = list(color_pts.keys())
+            self._color_targeted_color_idx = 0
+
+        # Find next non-empty queue, rotating across colors.
+        attempts = 0
+        while attempts < len(self._color_targeted_color_order):
+            color = self._color_targeted_color_order[
+                self._color_targeted_color_idx % len(self._color_targeted_color_order)
+            ]
+            queue = self._color_targeted_state.get(color, [])
+            if queue:
+                x, y = queue.pop(0)
+                self._color_targeted_color_idx += 1  # rotate next time
+                try:
+                    action = GameAction.ACTION6
+                    action.set_data({'x': int(x), 'y': int(y)})
+                except Exception:
+                    return _safe_random_action(self._rng, latest_frame)
+                action.reasoning = {
+                    'phase': 'fallback',
+                    'strategy': 'color_targeted',
+                    'color': int(color),
+                    'point': [int(x), int(y)],
+                }
+                return action
+            self._color_targeted_color_idx += 1
+            attempts += 1
+
+        # All queues exhausted — rebuild from current frame (state may have changed).
+        self._color_targeted_color_order = []
+        self._color_targeted_state = {}
+        return self._strategy_color_targeted(latest_frame)
+
+    def _strategy_action_id_sweep(self, latest_frame: FrameData) -> GameAction:
+        """v4 strategy: cycle every available action_id with N repeats each.
+
+        Forces the agent to try each action_id multiple times before moving on.
+        Catches games where one specific action_id is the gate but the agent
+        never tried it (e.g., ACTION7 when most games don't use it).
+        """
+        available = _available_action_ids(latest_frame)
+        if not available:
+            return _safe_random_action(self._rng, latest_frame)
+        repeats_per_action = 3
+        current_aid = available[self._action_id_sweep_idx % len(available)]
+        self._action_id_sweep_count += 1
+        if self._action_id_sweep_count >= repeats_per_action:
+            self._action_id_sweep_idx += 1
+            self._action_id_sweep_count = 0
+        try:
+            action = GameAction.from_id(int(current_aid))
+        except Exception:
+            return _safe_random_action(self._rng, latest_frame)
+        if action.is_complex():
+            # ACTION6: first repeat clicks center, others are random.
+            if self._action_id_sweep_count == 1:
+                action.set_data({'x': 32, 'y': 32})
+            else:
+                action.set_data({
+                    'x': self._rng.randint(0, 63),
+                    'y': self._rng.randint(0, 63),
+                })
+        action.reasoning = {
+            'phase': 'fallback',
+            'strategy': 'action_id_sweep',
+            'aid': int(current_aid),
+            'count': self._action_id_sweep_count,
+        }
+        return action
+
     def _strategy_action(self, latest_frame: FrameData) -> GameAction:
         strategy = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
         if strategy == 'random_full':
@@ -702,21 +954,58 @@ class MyAgent(Agent):
             return self._strategy_click_grid(latest_frame)
         if strategy == 'directional_sustained':
             return self._strategy_directional_sustained(latest_frame)
+        if strategy == 'edge_sweep':
+            return self._strategy_edge_sweep(latest_frame)
+        if strategy == 'color_targeted':
+            return self._strategy_color_targeted(latest_frame)
+        if strategy == 'action_id_sweep':
+            return self._strategy_action_id_sweep(latest_frame)
         return _safe_random_action(self._rng, latest_frame)
 
-    def _advance_strategy(self) -> None:
-        """Called when we hit GAME_OVER while in the post-replay phase."""
+    def _advance_strategy(self, reason: str = 'game_over') -> None:
+        """Pick the next Phase B strategy.
+
+        v4 improvement #3 — cross-attempt memory:
+          - First full cycle (attempts 1..N_STRATEGIES): rotate deterministically
+            from the archetype-default index, mirroring v3 behavior.
+          - After a full rotation: prefer the strategy that has cleared the most
+            levels in this game so far. Falls back to random if none has shown
+            progress.
+        """
         self._post_replay_reset_count += 1
-        # Start from initial archetype-strategy and advance from there so each
-        # new attempt tries a different archetype.
-        self._strategy_idx = self._initial_strategy_idx + self._post_replay_reset_count
+        n_strategies = len(self.STRATEGIES)
+        if self._post_replay_reset_count <= n_strategies:
+            self._strategy_idx = (self._initial_strategy_idx + self._post_replay_reset_count) % n_strategies
+            mode = 'rotation'
+        else:
+            best = None
+            best_levels = 0
+            for s, lv in self._strategy_levels.items():
+                if lv > best_levels:
+                    best_levels = lv
+                    best = s
+            if best is not None and best in self.STRATEGIES:
+                self._strategy_idx = self.STRATEGIES.index(best)
+                mode = 'exploit'
+            else:
+                self._strategy_idx = self._rng.randrange(n_strategies)
+                mode = 'random'
+        # Reset per-strategy cursors (existing + new v4 state).
         self._click_grid_idx = 0
         self._sustained_dir = None
         self._sustained_remaining = 0
+        self._edge_sweep_idx = 0
+        self._color_targeted_state = {}
+        self._color_targeted_color_order = []
+        self._color_targeted_color_idx = 0
+        self._action_id_sweep_idx = 0
+        self._action_id_sweep_count = 0
+        self._frozen_streak = 0
         next_strategy = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
         print(
-            f'[MyAgent] {self._short_id} post-replay reset #{self._post_replay_reset_count} '
-            f'-> strategy={next_strategy}',
+            f'[MyAgent] {self._short_id} reset #{self._post_replay_reset_count} '
+            f'reason={reason} mode={mode} -> strategy={next_strategy} '
+            f'strategy_levels={dict(self._strategy_levels)}',
             flush=True,
         )
 
@@ -743,17 +1032,81 @@ class MyAgent(Agent):
             # v3: record online action-effect from the previous transition.
             self._record_last_action_effect(frames, latest_frame)
 
-            # Phase A: replay-warm-start.
+            # v4 improvement #3: track per-strategy level progress.
+            current_levels = int(getattr(latest_frame, 'levels_completed', 0) or 0)
+            if current_levels > self._last_levels_seen:
+                delta = current_levels - self._last_levels_seen
+                cur_strat = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
+                self._strategy_levels[cur_strat] = self._strategy_levels.get(cur_strat, 0) + delta
+                self._last_levels_seen = current_levels
+
+            # v4 improvement #4: freeze detection.
+            # Trigger only mid-episode (not during PHASE A replay or initial state),
+            # not on GAME_OVER (that path advances strategy via the existing branch),
+            # and only if we have replay-exhausted (so we're in Phase B).
+            if (self._frozen_streak >= 8
+                    and self._replay_idx >= len(self._replay)
+                    and latest_frame.state not in (GameState.NOT_PLAYED, GameState.GAME_OVER, GameState.WIN)):
+                print(
+                    f'[MyAgent] {self._short_id} freeze detected '
+                    f'(streak={self._frozen_streak}) → switching strategy',
+                    flush=True,
+                )
+                self._advance_strategy(reason='freeze')
+
+            # Phase A: replay-warm-start (v4 fix: tactical RESET preserved).
+            #
+            # Critical insight: in cd82 (and likely ft09, sb26, others), the
+            # GT contains RESET markers in NOT_FINISHED state — the human is
+            # using RESET as a TACTICAL move (e.g., "clear paint and try
+            # again on this level") rather than a death-recovery action. Our
+            # pre-v4 code skipped these tactical resets when env state was
+            # NOT_FINISHED, causing the env to diverge from GT after the
+            # first tactical reset (record 21 for cd82).
+            #
+            # v4 fix: ALWAYS issue RESET when the next replay entry is a
+            # reset marker, regardless of env state. The env handles RESET
+            # gracefully in any state.
+            #
+            # Plus the prior fix: if env enters NOT_PLAYED/GAME_OVER but the
+            # NEXT replay entry isn't a reset, advance the cursor past the
+            # next reset marker forward so we re-sync at the next attempt.
             while self._replay_idx < len(self._replay):
                 entry = self._replay[self._replay_idx]
+                if entry.get('type') == 'reset':
+                    # Tactical RESET preserved — issue RESET and advance.
+                    self._replay_idx += 1
+                    action = GameAction.RESET
+                    action.reasoning = {
+                        'phase': 'warmstart',
+                        'marker': 'reset',
+                        'replay_idx': self._replay_idx,
+                    }
+                    self._last_returned_action = action
+                    return action
+                # Non-reset entry. If env is dead but GT didn't reset here,
+                # advance to next reset marker + 1 to re-sync segments.
+                if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
+                    next_reset = None
+                    for i in range(self._replay_idx, len(self._replay)):
+                        if self._replay[i].get('type') == 'reset':
+                            next_reset = i
+                            break
+                    if next_reset is None:
+                        self._replay_idx = len(self._replay)
+                        break
+                    self._replay_idx = next_reset + 1
+                    action = GameAction.RESET
+                    action.reasoning = {
+                        'phase': 'warmstart',
+                        'marker': 'reset',
+                        'state_driven': True,
+                        'segment_aligned_to': self._replay_idx,
+                    }
+                    self._last_returned_action = action
+                    return action
+                # State is healthy + entry is an action — play it.
                 self._replay_idx += 1
-                if entry['type'] == 'reset':
-                    if latest_frame.state in (GameState.NOT_PLAYED, GameState.GAME_OVER):
-                        action = GameAction.RESET
-                        action.reasoning = {'phase': 'warmstart', 'marker': 'reset'}
-                        self._last_returned_action = action
-                        return action
-                    continue
                 aid = int(entry['id'])
                 try:
                     action = GameAction.from_id(aid)

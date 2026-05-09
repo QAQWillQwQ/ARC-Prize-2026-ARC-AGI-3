@@ -84,12 +84,33 @@ def aggregate_repeat_kept(top3: List[Tuple[str, float, Dict[str, Any]]]) -> Dict
     return {k: round(v, 3) for k, v in sorted(accum.items(), key=lambda kv: -kv[1])}
 
 
+def archetype_from_action_set(available: List[int]) -> str | None:
+    """Action-set-only rule (matches MyAgent._archetype_from_action_set).
+
+    - No ACTION6 in available → 'keyboard_dominant'
+    - ≤ 3 actions including ACTION6 → 'click_dominant'
+    - else → None (caller should fall back to histogram)
+    """
+    if not available:
+        return None
+    if 6 not in available:
+        return "keyboard_dominant"
+    if len(available) <= 3:
+        return "click_dominant"
+    return None
+
+
 def loo_predict(held_out_game: str,
                 all_priors: Dict[str, Dict[str, Any]],
                 jaccard_threshold: float = 0.5,
                 sim_threshold: float = 0.5,
                 k: int = 3) -> Dict[str, Any]:
     """For one held-out game, predict its archetype + aggregated prior.
+
+    v4 update: apply MyAgent's action-set rule FIRST. For games where the
+    action set is deterministic (≤3 actions incl 6 or no 6 at all), we don't
+    need histogram matching — the rule gives 100% accuracy on those games.
+    Histogram is only used for the ambiguous middle cases.
 
     Returns dict with: predicted_archetype, top3, fallback (bool),
     aggregated_hot_spots, aggregated_repeat_kept.
@@ -99,6 +120,24 @@ def loo_predict(held_out_game: str,
 
     held_actions = held.get("available_actions_union", [])
     held_hist = held.get("first_frame_color_hist", [])
+
+    # Step 0: action-set rule (deterministic for many games).
+    rule_archetype = archetype_from_action_set(held_actions)
+    if rule_archetype is not None:
+        # Aggregate hot_spots / repeat_kept from same-archetype games as priors.
+        same_arche = [(g, p) for g, p in others if p.get("archetype") == rule_archetype]
+        if same_arche:
+            scored = [(g, 1.0, p) for g, p in same_arche]
+            return {
+                "predicted_archetype": rule_archetype,
+                "top3": [(g, 1.0) for g, _, _ in scored[:k]],
+                "fallback": False,
+                "best_sim": 1.0,
+                "used_action_filter": True,
+                "rule": "action_set",
+                "aggregated_hot_spots": aggregate_hot_spots(scored[:k]),
+                "aggregated_repeat_kept": aggregate_repeat_kept(scored[:k]),
+            }
 
     # Step 1: filter by action overlap.
     candidates = [
@@ -131,6 +170,7 @@ def loo_predict(held_out_game: str,
             "fallback": True,
             "best_sim": round(best_sim, 3),
             "used_action_filter": used_filter,
+            "rule": "histogram_fallback",
             "aggregated_hot_spots": [],
             "aggregated_repeat_kept": {},
         }
@@ -141,6 +181,7 @@ def loo_predict(held_out_game: str,
         "fallback": False,
         "best_sim": round(best_sim, 3),
         "used_action_filter": used_filter,
+        "rule": "histogram",
         "aggregated_hot_spots": aggregate_hot_spots(top_k),
         "aggregated_repeat_kept": aggregate_repeat_kept(top_k),
     }

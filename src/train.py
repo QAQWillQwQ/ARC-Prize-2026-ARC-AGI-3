@@ -4,6 +4,7 @@ import argparse
 import gc
 import hashlib
 import os
+import random
 import shutil
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -18,12 +19,15 @@ from .agent import PolicyGuidedAgent
 from .common import (
     ACTION_IDS,
     ACTION_TO_INDEX,
+    ARCHETYPE_LABELS,
     action_mask,
     append_metrics_row,
     compute_discounted_returns,
+    compute_saliency_mask,
     episode_level_actions,
     iter_jsonl_gz,
     load_metadata_map,
+    load_per_game_archetypes,
     merge_config,
     one_hot_frames,
     pad_history,
@@ -39,15 +43,43 @@ from .model import build_model, load_checkpoint, save_checkpoint
 
 
 class EpisodeTransitionDataset(Dataset):
-    def __init__(self, episodes: Sequence[Dict[str, Any]], history: int, max_steps: int) -> None:
+    def __init__(
+        self,
+        episodes: Sequence[Dict[str, Any]],
+        history: int,
+        max_steps: int,
+        archetype_map: Optional[Dict[str, int]] = None,
+        color_permutation_prob: float = 0.0,
+    ) -> None:
         self.episodes: List[Dict[str, Any]] = []
         self.sample_index: List[Tuple[int, int]] = []
         self.history = history
         self.max_steps = max_steps
         self.num_episodes = 0
+        self.archetype_map: Dict[str, int] = dict(archetype_map or {})
+        # Per-sample probability of applying a random color permutation to all
+        # frames in this sample. 0 disables (default). 0.5 = half of training
+        # samples see a randomized palette → forces the model to learn structural
+        # / positional features rather than per-game color → action mappings.
+        # Color 0 (background) is always identity; only colors 1..15 permute.
+        self.color_permutation_prob = float(color_permutation_prob)
 
         for episode in episodes:
             self.add_episode(episode)
+
+    @staticmethod
+    def _sample_color_perm() -> torch.Tensor:
+        """Random permutation of colors 1..15. Returns a (16,) long tensor mapping old→new."""
+        rest = list(range(1, 16))
+        random.shuffle(rest)
+        perm = [0] + rest
+        return torch.tensor(perm, dtype=torch.long)
+
+    @staticmethod
+    def _apply_color_perm(frame_tensor: torch.Tensor, perm_table: torch.Tensor) -> torch.Tensor:
+        """Apply ``perm_table`` (16,) to a frame tensor of any shape with values in [0, 15]."""
+        long = frame_tensor.to(dtype=torch.long).clamp_(0, 15)
+        return perm_table[long].to(dtype=frame_tensor.dtype)
 
     def add_episode(self, episode: Dict[str, Any]) -> bool:
         raw_transitions = list(episode.get("transitions", []))
@@ -96,6 +128,10 @@ class EpisodeTransitionDataset(Dataset):
             weight_mult = 1.5
         else:
             weight_mult = 0.4
+        short_id = str(episode.get("game_id", "")).split("-", 1)[0]
+        archetype_label = self.archetype_map.get(
+            short_id, ARCHETYPE_LABELS["mixed"]
+        )
         self.episodes.append(
             {
                 "transitions": transitions,
@@ -105,6 +141,7 @@ class EpisodeTransitionDataset(Dataset):
                 "last_action_before": last_action_before,
                 "steps_before": steps_before,
                 "weight_mult": weight_mult,
+                "archetype_label": int(archetype_label),
             }
         )
         self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
@@ -127,6 +164,28 @@ class EpisodeTransitionDataset(Dataset):
         progress = int(transition["levels_after"]) - int(transition["levels_before"])
         next_steps_since_progress = 0 if progress > 0 else int(episode["steps_before"][transition_index]) + 1
         action_id = int(transition["action_id"])
+
+        current_frame = history_frames[-1]
+        next_frame = next_history_frames[-1]
+        # Saliency target = "where the agent should look NOW" (mask of current frame).
+        # Computed BEFORE color-permutation since the algorithm is invariant to
+        # color labels (it counts pixels-per-color and finds rare-color centroids;
+        # permuting labels reshuffles which int corresponds to which set of
+        # pixels, but the SET of rare-pixel positions — hence the centroid mask —
+        # is unchanged). Verified: rare-colors test by count, not by id.
+        saliency_target = compute_saliency_mask(current_frame.tolist())
+
+        # Color-permutation augmentation. Apply the SAME perm to obs, next_obs,
+        # and next_frame_target so the BC objective is consistent under the
+        # permutation. Probability gate happens once per sample.
+        if self.color_permutation_prob > 0.0 and random.random() < self.color_permutation_prob:
+            perm_table = self._sample_color_perm()
+            history_frames = self._apply_color_perm(history_frames, perm_table)
+            next_history_frames = self._apply_color_perm(next_history_frames, perm_table)
+            next_frame = self._apply_color_perm(next_frame, perm_table)
+
+        # Next-frame recon target = the frame after the current action, as long color indices.
+        next_frame_target = next_frame.to(dtype=torch.long).clamp(0, 15)
 
         return {
             "obs": self._encode_history(history_frames),
@@ -155,6 +214,9 @@ class EpisodeTransitionDataset(Dataset):
             "y": torch.tensor(int((transition.get("action_data") or {}).get("y", 0)), dtype=torch.long),
             "coord_mask": torch.tensor(1.0 if action_id == 6 else 0.0, dtype=torch.float32),
             "return_target": torch.tensor(float(episode["returns"][transition_index]), dtype=torch.float32),
+            "archetype_label": torch.tensor(int(episode["archetype_label"]), dtype=torch.long),
+            "saliency_target": saliency_target,
+            "next_frame_target": next_frame_target,
             "weight": torch.tensor(
                 float(episode["weight_mult"])
                 * (
@@ -221,6 +283,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--log-every-batches", type=int, default=100)
     parser.add_argument("--data-workers", type=int, default=None)
+    parser.add_argument("--aux-archetype-weight", type=float, default=None,
+                        help="Loss weight for archetype CE head (Plan A). 0 disables. Default: 0.15.")
+    parser.add_argument("--aux-saliency-weight", type=float, default=None,
+                        help="Loss weight for saliency BCE head (Plan A). 0 disables. Default: 0.10.")
+    parser.add_argument("--aux-recon-weight", type=float, default=None,
+                        help="Loss weight for next-frame recon CE head (Plan A). 0 disables. Default: 0.10.")
+    parser.add_argument("--per-game-priors-path", type=str, default=None,
+                        help="Path to per_game_priors.json for archetype labels. "
+                             "Defaults to <project-root>/Local_Output/per_game_priors.json.")
+    parser.add_argument("--color-permutation-prob", type=float, default=None,
+                        help="Per-sample probability of randomly permuting colors 1..15 "
+                             "(background fixed). Forces the model to learn color-invariant "
+                             "features. 0 disables. Default: 0.5 — proxy for hidden-game palette shift.")
     return parser.parse_args()
 
 
@@ -414,7 +489,8 @@ def restore_training_state(
     device: torch.device,
 ) -> Dict[str, Any]:
     payload = load_checkpoint(str(resume_path), device=device)
-    model.load_state_dict(payload["model_state"])
+    # strict=False so pre-aux-head checkpoints can seed a new run with the new heads.
+    model.load_state_dict(payload["model_state"], strict=False)
     optimizer_state = payload.get("optimizer_state")
     if optimizer_state is not None:
         optimizer.load_state_dict(optimizer_state)
@@ -483,6 +559,9 @@ def run_epoch(
     checkpoint_every_steps: int = 0,
     checkpoint_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     log_every_batches: int = 0,
+    aux_archetype_weight: float = 0.0,
+    aux_saliency_weight: float = 0.0,
+    aux_recon_weight: float = 0.0,
 ) -> Dict[str, float]:
     train_mode = optimizer is not None
     model.train(train_mode)
@@ -493,10 +572,15 @@ def run_epoch(
     total_value_loss = 0.0
     total_avail_loss = 0.0
     total_latent_loss = 0.0
+    total_archetype_loss = 0.0
+    total_saliency_loss = 0.0
+    total_recon_loss = 0.0
     total_action_correct = 0.0
     total_action_count = 0.0
     total_coord_correct = 0.0
     total_coord_count = 0.0
+    total_archetype_correct = 0.0
+    total_archetype_count = 0.0
     optimizer_steps = 0
     seen_samples = 0
 
@@ -542,12 +626,36 @@ def run_epoch(
             value_loss = 0.25 * masked_average(value_loss_per, weights)
             avail_loss = 0.2 * masked_average(avail_loss_per, weights)
             latent_loss = 0.1 * masked_average(latent_loss_per, weights)
+
+            # Option D aux losses (Plan A heads): archetype CE + saliency BCE + next-frame recon CE.
+            archetype_loss_per = F.cross_entropy(
+                out["archetype_logits"],
+                batch["archetype_label"],
+                reduction="none",
+            )
+            saliency_loss_per = F.binary_cross_entropy_with_logits(
+                out["saliency_logits"],
+                batch["saliency_target"],
+                reduction="none",
+            ).mean(dim=(-1, -2))
+            recon_loss_per = F.cross_entropy(
+                out["next_frame_recon_logits"],
+                batch["next_frame_target"],
+                reduction="none",
+            ).mean(dim=(-1, -2))
+            archetype_loss = aux_archetype_weight * masked_average(archetype_loss_per, weights)
+            saliency_loss = aux_saliency_weight * masked_average(saliency_loss_per, weights)
+            recon_loss = aux_recon_weight * masked_average(recon_loss_per, weights)
+
             loss = (
                 action_loss
                 + coord_loss
                 + value_loss
                 + avail_loss
                 + latent_loss
+                + archetype_loss
+                + saliency_loss
+                + recon_loss
             )
 
         if optimizer is not None:
@@ -577,9 +685,15 @@ def run_epoch(
         total_value_loss += float(value_loss.item()) * batch_size
         total_avail_loss += float(avail_loss.item()) * batch_size
         total_latent_loss += float(latent_loss.item()) * batch_size
+        total_archetype_loss += float(archetype_loss.item()) * batch_size
+        total_saliency_loss += float(saliency_loss.item()) * batch_size
+        total_recon_loss += float(recon_loss.item()) * batch_size
         action_pred = out["action_logits"].argmax(dim=-1)
         total_action_correct += float((action_pred == batch["action_index"]).sum().item())
         total_action_count += float(batch["action_index"].numel())
+        archetype_pred = out["archetype_logits"].argmax(dim=-1)
+        total_archetype_correct += float((archetype_pred == batch["archetype_label"]).sum().item())
+        total_archetype_count += float(batch["archetype_label"].numel())
 
         coord_mask = batch["coord_mask"] > 0
         if coord_mask.any():
@@ -616,8 +730,12 @@ def run_epoch(
         "value_loss": total_value_loss / denom,
         "avail_loss": total_avail_loss / denom,
         "latent_loss": total_latent_loss / denom,
+        "archetype_loss": total_archetype_loss / denom,
+        "saliency_loss": total_saliency_loss / denom,
+        "recon_loss": total_recon_loss / denom,
         "action_acc": total_action_correct / max(total_action_count, 1.0),
         "coord_acc": total_coord_correct / max(total_coord_count, 1.0),
+        "archetype_acc": total_archetype_correct / max(total_archetype_count, 1.0),
     }
 
 
@@ -648,10 +766,21 @@ def main() -> None:
         "stall_steps": args.stall_steps,
         "reset_limit": args.reset_limit,
         "data_workers": args.data_workers,
+        "aux_archetype_weight": args.aux_archetype_weight,
+        "aux_saliency_weight": args.aux_saliency_weight,
+        "aux_recon_weight": args.aux_recon_weight,
+        "color_permutation_prob": args.color_permutation_prob,
     }
     config = merge_config(args.hardware_profile, overrides)
     config["hardware_profile"] = args.hardware_profile
     config["seed"] = args.seed
+    # Plan-D aux loss + augmentation defaults (apply only when not set by profile or CLI override).
+    # Hidden-LB rationale: aux losses regularize encoder; color permutation forces palette
+    # invariance so train→hidden-game generalization isn't bottlenecked by per-game color cues.
+    config.setdefault("aux_archetype_weight", 0.15)
+    config.setdefault("aux_saliency_weight", 0.10)
+    config.setdefault("aux_recon_weight", 0.10)
+    config.setdefault("color_permutation_prob", 0.5)
     data_paths = parse_data_paths(args.data)
     requested_games = parse_game_filter(args.games)
     config["data"] = [str(path) for path in data_paths]
@@ -680,15 +809,33 @@ def main() -> None:
         % discovered_episodes,
         flush=True,
     )
+    archetype_path = (
+        Path(args.per_game_priors_path).resolve()
+        if args.per_game_priors_path
+        else (project_root / "Local_Output" / "per_game_priors.json")
+    )
+    archetype_map = load_per_game_archetypes(archetype_path)
+    print(
+        "[data] archetype labels loaded: %d games from %s"
+        % (len(archetype_map), archetype_path),
+        flush=True,
+    )
+    config["per_game_priors_path"] = str(archetype_path)
     train_dataset = EpisodeTransitionDataset(
         episodes=[],
         history=int(config["history"]),
         max_steps=int(config["max_steps"]),
+        archetype_map=archetype_map,
+        color_permutation_prob=float(config.get("color_permutation_prob", 0.0)),
     )
+    # Val dataset uses the natural color distribution so val metrics are
+    # comparable across runs — augmentation is a train-time-only regularizer.
     val_dataset = EpisodeTransitionDataset(
         episodes=[],
         history=int(config["history"]),
         max_steps=int(config["max_steps"]),
+        archetype_map=archetype_map,
+        color_permutation_prob=0.0,
     )
     loaded_episodes = 0
     for episode in iter_episodes_from_paths(data_paths, allowed_games=requested_games):
@@ -891,6 +1038,9 @@ def main() -> None:
                 checkpoint_every_steps=int(config.get("checkpoint_every_steps", 0)),
                 checkpoint_callback=checkpoint_callback,
                 log_every_batches=int(config.get("log_every_batches", 0)),
+                aux_archetype_weight=float(config.get("aux_archetype_weight", 0.0)),
+                aux_saliency_weight=float(config.get("aux_saliency_weight", 0.0)),
+                aux_recon_weight=float(config.get("aux_recon_weight", 0.0)),
             )
             val_metrics = run_epoch(
                 model=model,
@@ -901,6 +1051,9 @@ def main() -> None:
                 epoch=epoch,
                 phase="val",
                 log_every_batches=int(config.get("log_every_batches", 0)),
+                aux_archetype_weight=float(config.get("aux_archetype_weight", 0.0)),
+                aux_saliency_weight=float(config.get("aux_saliency_weight", 0.0)),
+                aux_recon_weight=float(config.get("aux_recon_weight", 0.0)),
             )
 
             last_checkpoint = save_training_checkpoint(
@@ -952,21 +1105,29 @@ def main() -> None:
                 "train_value_loss": round(train_metrics["value_loss"], 6),
                 "train_avail_loss": round(train_metrics["avail_loss"], 6),
                 "train_latent_loss": round(train_metrics["latent_loss"], 6),
+                "train_archetype_loss": round(train_metrics["archetype_loss"], 6),
+                "train_saliency_loss": round(train_metrics["saliency_loss"], 6),
+                "train_recon_loss": round(train_metrics["recon_loss"], 6),
                 "train_action_acc": round(train_metrics["action_acc"], 6),
                 "train_coord_acc": round(train_metrics["coord_acc"], 6),
+                "train_archetype_acc": round(train_metrics["archetype_acc"], 6),
                 "val_loss": round(val_metrics["loss"], 6),
                 "val_action_loss": round(val_metrics["action_loss"], 6),
                 "val_coord_loss": round(val_metrics["coord_loss"], 6),
                 "val_value_loss": round(val_metrics["value_loss"], 6),
                 "val_avail_loss": round(val_metrics["avail_loss"], 6),
                 "val_latent_loss": round(val_metrics["latent_loss"], 6),
+                "val_archetype_loss": round(val_metrics["archetype_loss"], 6),
+                "val_saliency_loss": round(val_metrics["saliency_loss"], 6),
+                "val_recon_loss": round(val_metrics["recon_loss"], 6),
                 "val_action_acc": round(val_metrics["action_acc"], 6),
                 "val_coord_acc": round(val_metrics["coord_acc"], 6),
+                "val_archetype_acc": round(val_metrics["archetype_acc"], 6),
                 "public_val_score": None if public_val_score is None else round(public_val_score, 6),
             }
             append_metrics_row(metrics_path, row)
             print(
-                "[epoch] %d/%d train_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f train_action_acc=%.6f train_coord_acc=%.6f val_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f val_action_acc=%.6f val_coord_acc=%.6f public_val_score=%s"
+                "[epoch] %d/%d train_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f arche=%.6f sal=%.6f recon=%.6f train_action_acc=%.6f train_coord_acc=%.6f train_arche_acc=%.6f val_loss=%.6f action=%.6f coord=%.6f value=%.6f avail=%.6f latent=%.6f arche=%.6f sal=%.6f recon=%.6f val_action_acc=%.6f val_coord_acc=%.6f val_arche_acc=%.6f public_val_score=%s"
                 % (
                     epoch,
                     int(config["epochs"]),
@@ -976,16 +1137,24 @@ def main() -> None:
                     train_metrics["value_loss"],
                     train_metrics["avail_loss"],
                     train_metrics["latent_loss"],
+                    train_metrics["archetype_loss"],
+                    train_metrics["saliency_loss"],
+                    train_metrics["recon_loss"],
                     train_metrics["action_acc"],
                     train_metrics["coord_acc"],
+                    train_metrics["archetype_acc"],
                     val_metrics["loss"],
                     val_metrics["action_loss"],
                     val_metrics["coord_loss"],
                     val_metrics["value_loss"],
                     val_metrics["avail_loss"],
                     val_metrics["latent_loss"],
+                    val_metrics["archetype_loss"],
+                    val_metrics["saliency_loss"],
+                    val_metrics["recon_loss"],
                     val_metrics["action_acc"],
                     val_metrics["coord_acc"],
+                    val_metrics["archetype_acc"],
                     "n/a" if public_val_score is None else ("%.6f" % public_val_score),
                 ),
                 flush=True,

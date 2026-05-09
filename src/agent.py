@@ -41,7 +41,10 @@ class PolicyBundle:
         payload = load_checkpoint(checkpoint_path, device=device)
         config = dict(payload["config"])
         self.model = build_model(config)
-        self.model.load_state_dict(payload["model_state"])
+        # strict=False so old checkpoints (pre-aux-heads) still load. The new
+        # archetype/saliency/recon heads aren't read at inference anyway —
+        # PolicyBundle.infer only consumes action/x/y/value logits.
+        self.model.load_state_dict(payload["model_state"], strict=False)
         self.model.to(device)
         self.model.eval()
         self.device = device

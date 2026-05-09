@@ -653,6 +653,103 @@ def transition_reward(transition: Dict[str, Any]) -> float:
     return reward
 
 
+# Option D aux-loss helpers (BC v1).
+ARCHETYPE_LABELS: Dict[str, int] = {
+    "click_dominant": 0,
+    "keyboard_dominant": 1,
+    "mixed": 2,
+}
+ARCHETYPE_NAMES: List[str] = ["click_dominant", "keyboard_dominant", "mixed"]
+
+
+def load_per_game_archetypes(path: Optional[Path] = None) -> Dict[str, int]:
+    """Map short_id → archetype-int from per_game_priors.json. Empty dict if missing."""
+    candidate = Path(path) if path is not None else Path("Local_Output") / "per_game_priors.json"
+    if not candidate.exists():
+        return {}
+    try:
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: Dict[str, int] = {}
+    for short_id, prior in data.items():
+        archetype = str((prior or {}).get("archetype", "mixed"))
+        out[str(short_id)] = ARCHETYPE_LABELS.get(archetype, ARCHETYPE_LABELS["mixed"])
+    return out
+
+
+def compute_saliency_mask(
+    frame: Sequence[Sequence[int]],
+    neighborhood: int = 1,
+) -> torch.Tensor:
+    """64x64 binary saliency target — same algorithm as kaggle_notebook/my_agent.py:_extract_saliency.
+
+    Salient points: rare-color centroids + bbox corners + 4-direction offsets,
+    plus 9 default fallback points (center, corners, edge midpoints). Each point
+    becomes a (2*neighborhood+1) square of 1s in the mask. Default neighborhood=1
+    yields ~6-10% positive pixels — a reasonable BCE target density.
+    """
+    rows = len(frame) if frame else 0
+    cols = len(frame[0]) if rows else 0
+    mask = torch.zeros((GRID_SIZE, GRID_SIZE), dtype=torch.float32)
+
+    def _stamp(points: Sequence[Tuple[int, int]]) -> None:
+        for x, y in points:
+            for dy in range(-neighborhood, neighborhood + 1):
+                for dx in range(-neighborhood, neighborhood + 1):
+                    xx, yy = int(x) + dx, int(y) + dy
+                    if 0 <= xx < GRID_SIZE and 0 <= yy < GRID_SIZE:
+                        mask[yy, xx] = 1.0
+
+    if rows < 1 or cols < 1:
+        _stamp([(32, 32), (5, 5), (5, 58), (58, 5), (58, 58)])
+        return mask
+
+    color_counts: Dict[int, int] = {}
+    color_pixels: Dict[int, List[Tuple[int, int]]] = {}
+    for y in range(min(rows, GRID_SIZE)):
+        row = frame[y]
+        if not _is_iterable(row):
+            continue
+        cols_y = min(cols, GRID_SIZE, len(row))
+        for x in range(cols_y):
+            ci = _safe_color(row[x])
+            color_counts[ci] = color_counts.get(ci, 0) + 1
+            color_pixels.setdefault(ci, []).append((x, y))
+
+    rare_colors = sorted(
+        (c for c, cnt in color_counts.items() if c != 0 and 1 <= cnt <= 200),
+        key=lambda c: color_counts[c],
+    )
+
+    salient: List[Tuple[int, int]] = []
+    for color in rare_colors[:6]:
+        pts = color_pixels[color]
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        if not xs:
+            continue
+        cx = int(sum(xs) / len(xs))
+        cy = int(sum(ys) / len(ys))
+        salient.append((cx, cy))
+        if len(pts) >= 3:
+            x_lo, x_hi = min(xs), max(xs)
+            y_lo, y_hi = min(ys), max(ys)
+            salient.extend([(x_lo, y_lo), (x_lo, y_hi), (x_hi, y_lo), (x_hi, y_hi)])
+        if len(pts) >= 5:
+            for dx, dy in ((4, 0), (-4, 0), (0, 4), (0, -4)):
+                ox = max(0, min(GRID_SIZE - 1, cx + dx))
+                oy = max(0, min(GRID_SIZE - 1, cy + dy))
+                salient.append((ox, oy))
+
+    salient.extend([
+        (32, 32), (5, 5), (5, 58), (58, 5), (58, 58),
+        (32, 5), (32, 58), (5, 32), (58, 32),
+    ])
+    _stamp(salient)
+    return mask
+
+
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     torch.manual_seed(seed)
