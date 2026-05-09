@@ -60,7 +60,11 @@ sys.path.insert(0, str(ROOT))
 from arc_agi import Arcade, OperationMode  # noqa: E402
 from arcengine import GameAction, GameState  # noqa: E402
 
-from src.agent import PolicyGuidedAgent  # noqa: E402
+# NOTE: src.agent transitively imports torch (~500MB per worker process).
+# When every Phase B task has a forced strategy (the typical case), the
+# PolicyGuidedAgent fallback below is unreachable. We lazy-import inside the
+# else branch so workers that never hit it don't load torch at all.
+# Memory savings: ~500MB × n_workers.
 from src.common import (  # noqa: E402
     append_jsonl_gz,
     final_subframe,
@@ -530,6 +534,8 @@ def collect_one(
                 traceback.print_exc()
         else:
             # Default Phase B: PolicyGuidedAgent (no strategy override).
+            # Lazy import — keeps torch out of workers that never reach this path.
+            from src.agent import PolicyGuidedAgent  # noqa: E402
             agent = PolicyGuidedAgent(
                 checkpoint_path=None,
                 max_steps=remaining,
@@ -690,8 +696,30 @@ def main() -> int:
     })
 
     completed = 0
+    n_errors = 0
     t0 = time.time()
+    last_log_t = t0
     bucket_counts: Dict[str, int] = {}
+
+    def _fmt_secs(secs: float) -> str:
+        secs = int(max(0, secs))
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        if h:
+            return f"{h:d}h{m:02d}m{s:02d}s"
+        return f"{m:d}m{s:02d}s"
+
+    print(
+        f"[collect-gt] start: total_tasks={total} workers={args.workers} "
+        f"max_steps={args.max_steps}",
+        flush=True,
+    )
+    print(
+        f"[collect-gt] expected per-task wall: ~5-30s; estimated finish: "
+        f"~{_fmt_secs(total * 8.0 / max(1, int(args.workers)))} on {args.workers} workers",
+        flush=True,
+    )
+
     with ProcessPoolExecutor(max_workers=max(1, int(args.workers))) as pool:
         futures = {
             pool.submit(
@@ -713,19 +741,40 @@ def main() -> int:
             bucket_counts[tag] = bucket_counts.get(tag, 0) + 1
             wall = time.time() - t0
             err = payload.get("error")
+            if err:
+                n_errors += 1
             lvl = payload.get("levels_completed", "?")
             n_act = payload.get("actions_taken", "?")
-            if err:
-                print(
-                    f"[collect-gt] {completed}/{total} {short_id} ERR={err} wall={wall:.1f}s",
-                    flush=True,
-                )
-            elif completed % 50 == 0 or completed == total:
-                print(
-                    f"[collect-gt] {completed}/{total} {short_id} dev={int(dev*100)}% seed={seed} "
-                    f"perturb={perturb:.2f} strat={strat} levels={lvl} actions={n_act} tag={tag} wall={wall:.1f}s",
-                    flush=True,
-                )
+            # Log every 50 completed OR at end OR every 30 wall-seconds OR on error.
+            now = time.time()
+            should_log = (
+                completed % 50 == 0
+                or completed == total
+                or (now - last_log_t) >= 30.0
+                or err
+            )
+            if should_log:
+                last_log_t = now
+                rate = completed / max(0.001, wall)
+                eta_secs = (total - completed) / max(0.001, rate)
+                pct = 100.0 * completed / max(1, total)
+                if err:
+                    print(
+                        f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
+                        f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
+                        f"rate={rate:.2f}/s errs={n_errors} :: {short_id} ERR={err}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[collect-gt] {completed}/{total} ({pct:.1f}%) "
+                        f"elapsed={_fmt_secs(wall)} eta={_fmt_secs(eta_secs)} "
+                        f"rate={rate:.2f}/s errs={n_errors} buckets={dict(bucket_counts)} "
+                        f":: {short_id} dev={int(dev*100)}% seed={seed} "
+                        f"perturb={perturb:.2f} strat={strat} levels={lvl} "
+                        f"actions={n_act} tag={tag}",
+                        flush=True,
+                    )
 
     save_json(output_root / "summary.json", {
         "tasks_total": total,

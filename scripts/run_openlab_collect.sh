@@ -36,8 +36,11 @@ COLLECT_DIR="$PROJECT_ROOT/Local_Output/Collection_Cache"
 mkdir -p "$LOG_DIR" "$COLLECT_DIR"
 
 # ---------- defaults ----------
-WORKERS=64
-MAX_STEPS=3000
+# Memory-conservative defaults: WORKERS=8 keeps total RAM under ~10 GB at the
+# default max_steps. Bump --workers if your box has the RAM and process budget.
+# Past blowups: 96 workers × 3000 max_steps hit ~300 GB RSS on Openlab.
+WORKERS=8
+MAX_STEPS=1500
 OUTPUT_NAME="staged_v2_gt"
 DEVIATIONS="0,25,50,75,100"
 SEEDS=4
