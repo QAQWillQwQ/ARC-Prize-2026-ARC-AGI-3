@@ -6,6 +6,7 @@ import hashlib
 import os
 import random
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -51,6 +52,9 @@ class EpisodeTransitionDataset(Dataset):
         archetype_map: Optional[Dict[str, int]] = None,
         color_permutation_prob: float = 0.0,
         max_transitions_per_episode: Optional[int] = None,
+        compute_saliency: bool = True,
+        compute_next_frame_target: bool = True,
+        compute_archetype_label: bool = True,
     ) -> None:
         self.episodes: List[Dict[str, Any]] = []
         self.sample_index: List[Tuple[int, int]] = []
@@ -67,6 +71,19 @@ class EpisodeTransitionDataset(Dataset):
         # Stride sampling was rejected because it breaks the consecutive
         # next_frame relation the latent-prediction loss depends on.
         self.max_transitions_per_episode = max_transitions_per_episode
+        # Per-sample compute gates. When the corresponding aux loss weight
+        # is 0, skip the expensive __getitem__ work that produces the target
+        # tensor. saliency in particular calls .tolist() + Python loop per
+        # sample which dominates DataLoader CPU time on bc_v2-scale corpora.
+        self.compute_saliency = bool(compute_saliency)
+        self.compute_next_frame_target = bool(compute_next_frame_target)
+        self.compute_archetype_label = bool(compute_archetype_label)
+        # Reusable zero tensors so when the aux is disabled we still return a
+        # consistent dict shape (the loss multiplies by 0 anyway, but the
+        # batch must collate cleanly across samples).
+        self._zero_saliency = torch.zeros((64, 64), dtype=torch.float32)
+        self._zero_next_frame_target = torch.zeros((64, 64), dtype=torch.long)
+        self._zero_archetype_label = torch.tensor(0, dtype=torch.long)
         # Per-sample probability of applying a random color permutation to all
         # frames in this sample. 0 disables (default). 0.5 = half of training
         # samples see a randomized palette → forces the model to learn structural
@@ -201,11 +218,12 @@ class EpisodeTransitionDataset(Dataset):
         next_frame = next_history_frames[-1]
         # Saliency target = "where the agent should look NOW" (mask of current frame).
         # Computed BEFORE color-permutation since the algorithm is invariant to
-        # color labels (it counts pixels-per-color and finds rare-color centroids;
-        # permuting labels reshuffles which int corresponds to which set of
-        # pixels, but the SET of rare-pixel positions — hence the centroid mask —
-        # is unchanged). Verified: rare-colors test by count, not by id.
-        saliency_target = compute_saliency_mask(current_frame.tolist())
+        # color labels. Skipped when aux_saliency_weight=0 — the .tolist() +
+        # Python loop is the dominant per-sample CPU cost on bc_v2 corpora.
+        if self.compute_saliency:
+            saliency_target = compute_saliency_mask(current_frame.tolist())
+        else:
+            saliency_target = self._zero_saliency
 
         # Color-permutation augmentation. Apply the SAME perm to obs, next_obs,
         # and next_frame_target so the BC objective is consistent under the
@@ -217,7 +235,11 @@ class EpisodeTransitionDataset(Dataset):
             next_frame = self._apply_color_perm(next_frame, perm_table)
 
         # Next-frame recon target = the frame after the current action, as long color indices.
-        next_frame_target = next_frame.to(dtype=torch.long).clamp(0, 15)
+        # Skipped when aux_recon_weight=0.
+        if self.compute_next_frame_target:
+            next_frame_target = next_frame.to(dtype=torch.long).clamp(0, 15)
+        else:
+            next_frame_target = self._zero_next_frame_target
 
         return {
             "obs": self._encode_history(history_frames),
@@ -246,7 +268,11 @@ class EpisodeTransitionDataset(Dataset):
             "y": torch.tensor(int((transition.get("action_data") or {}).get("y", 0)), dtype=torch.long),
             "coord_mask": torch.tensor(1.0 if action_id == 6 else 0.0, dtype=torch.float32),
             "return_target": torch.tensor(float(episode["returns"][transition_index]), dtype=torch.float32),
-            "archetype_label": torch.tensor(int(episode["archetype_label"]), dtype=torch.long),
+            "archetype_label": (
+                torch.tensor(int(episode["archetype_label"]), dtype=torch.long)
+                if self.compute_archetype_label
+                else self._zero_archetype_label
+            ),
             "saliency_target": saliency_target,
             "next_frame_target": next_frame_target,
             "weight": torch.tensor(
@@ -763,6 +789,12 @@ def run_epoch(
     if optimizer is not None:
         optimizer.zero_grad(set_to_none=True)
 
+    # Per-batch wall-time tracking for throughput reporting.
+    epoch_t0 = time.monotonic()
+    last_log_t = epoch_t0
+    last_log_seen_samples = 0
+    n_batches = len(loader)
+
     for step, batch in enumerate(loader):
         batch_size = int(batch["obs"].shape[0])
         batch = move_batch(batch, device)
@@ -881,21 +913,44 @@ def run_epoch(
             running_loss = total_loss / max(seen_samples, 1)
             running_action_acc = total_action_correct / max(total_action_count, 1.0)
             running_coord_acc = total_coord_correct / max(total_coord_count, 1.0)
+            now = time.monotonic()
+            window_secs = max(1e-6, now - last_log_t)
+            window_samples = max(0, seen_samples - last_log_seen_samples)
+            window_batches = max(1, log_every_batches if (step + 1) % log_every_batches == 0 else (step + 1) % log_every_batches)
+            sec_per_batch = window_secs / window_batches
+            samples_per_sec = window_samples / window_secs
+            elapsed_total = now - epoch_t0
+            remaining_batches = max(0, n_batches - (step + 1))
+            eta_secs = remaining_batches * sec_per_batch
+            def _fmt(s: float) -> str:
+                s = int(max(0, s))
+                h, rem = divmod(s, 3600)
+                m, sec = divmod(rem, 60)
+                if h:
+                    return f"{h:d}h{m:02d}m{sec:02d}s"
+                return f"{m:d}m{sec:02d}s"
             print(
-                "[%s] epoch=%d batch=%d/%d samples=%d/%d loss=%.4f action_acc=%.4f coord_acc=%.4f"
+                "[%s] epoch=%d batch=%d/%d samples=%d/%d loss=%.4f action_acc=%.4f coord_acc=%.4f "
+                "spb=%.3fs sps=%.0f elapsed=%s eta=%s"
                 % (
                     phase,
                     epoch,
                     step + 1,
-                    len(loader),
+                    n_batches,
                     seen_samples,
                     len(loader.dataset),
                     running_loss,
                     running_action_acc,
                     running_coord_acc,
+                    sec_per_batch,
+                    samples_per_sec,
+                    _fmt(elapsed_total),
+                    _fmt(eta_secs),
                 ),
                 flush=True,
             )
+            last_log_t = now
+            last_log_seen_samples = seen_samples
 
     denom = max(len(loader.dataset), 1)
     return {
@@ -996,6 +1051,18 @@ def main() -> None:
         flush=True,
     )
     config["per_game_priors_path"] = str(archetype_path)
+    # Skip per-sample compute when the corresponding aux loss is disabled.
+    # Saliency mask is the dominant per-sample CPU cost (Python loop over 4096
+    # cells via .tolist()); skipping it when the weight is 0 unlocks 2-3x
+    # DataLoader throughput on bc_v2-scale corpora.
+    _aux_sal_w = float(config.get("aux_saliency_weight", 0.0))
+    _aux_recon_w = float(config.get("aux_recon_weight", 0.0))
+    _aux_arche_w = float(config.get("aux_archetype_weight", 0.0))
+    print(
+        "[data] aux compute gates: saliency=%s recon=%s archetype=%s"
+        % (_aux_sal_w > 0, _aux_recon_w > 0, _aux_arche_w > 0),
+        flush=True,
+    )
     train_dataset = EpisodeTransitionDataset(
         episodes=[],
         history=int(config["history"]),
@@ -1003,6 +1070,9 @@ def main() -> None:
         archetype_map=archetype_map,
         color_permutation_prob=float(config.get("color_permutation_prob", 0.0)),
         max_transitions_per_episode=args.max_transitions_per_episode,
+        compute_saliency=_aux_sal_w > 0,
+        compute_next_frame_target=_aux_recon_w > 0,
+        compute_archetype_label=_aux_arche_w > 0,
     )
     # Val dataset uses the natural color distribution so val metrics are
     # comparable across runs — augmentation is a train-time-only regularizer.
@@ -1013,6 +1083,9 @@ def main() -> None:
         archetype_map=archetype_map,
         color_permutation_prob=0.0,
         max_transitions_per_episode=args.max_transitions_per_episode,
+        compute_saliency=_aux_sal_w > 0,
+        compute_next_frame_target=_aux_recon_w > 0,
+        compute_archetype_label=_aux_arche_w > 0,
     )
     loaded_episodes = 0
     for episode in iter_episodes_from_paths(data_paths, allowed_games=requested_games):
