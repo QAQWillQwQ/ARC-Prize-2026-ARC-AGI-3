@@ -1,6 +1,6 @@
 # =====================================================================
-# WarmstartAgent v3 — replay-warm-start + per-game priors + visual
-# saliency + online action-effect learning.
+# WarmstartAgent v4 — replay-warm-start + per-game priors + visual
+# saliency + online action-effect learning + v4 enrichments below.
 #
 # Phase A (warmstart): plays GT replay actions verbatim until exhausted.
 #   Honors RESET markers (action_input.id == 0 while state == GAME_OVER).

@@ -68,27 +68,23 @@ def main() -> int:
     levels_pct_by_bucket: Dict[str, Counter] = {b: Counter() for b in BUCKETS}
 
     with gzip.open(gz_path, "rt") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            # Speed hack: truncate before the giant "transitions" array.
-            # collect_gt_warmstart.py writes summary keys first, then "transitions" LAST,
-            # so chopping at `,"transitions":` and re-closing the dict gives us a tiny
-            # JSON object with just the summary. ~100x faster than parsing the full line.
-            idx = line.find(',"transitions":')
+        for raw_line in f:
+            # Speed hack: don't strip / scan the full ~50 MB line. The summary
+            # fields all live in the first ~300 chars; "transitions" is always
+            # the last key in the dict. Slice the head, find the transitions key
+            # there (note the space after comma — json.dumps default separator),
+            # truncate, re-close the dict.
+            head = raw_line[:1024]
+            idx = head.find(', "transitions":')
             if idx > 0:
-                summary_text = line[:idx] + "}"
+                summary_text = head[:idx] + "}"
             else:
-                summary_text = line
+                # Fallback: parse the full line (slow but safe)
+                summary_text = raw_line.strip()
             try:
                 ep = json.loads(summary_text)
             except json.JSONDecodeError:
-                # Fallback: try parsing the full line (may be slow but won't drop data)
-                try:
-                    ep = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
+                continue
             short_id = ep.get("short_id", "?")
             bucket = ep.get("source", "?")
             state = ep.get("final_state", "?")

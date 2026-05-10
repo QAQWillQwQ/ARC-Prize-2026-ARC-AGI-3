@@ -583,8 +583,17 @@ def collect_one(
         return {"game_id": full_id, "error": "env_make_returned_None"}
     # Reset to a clean initial state. For a freshly-made env this is a no-op;
     # for a cached env it restarts the game so the next task starts cleanly.
+    #
+    # arc_agi quirk: the first reset() on a cached env that was previously
+    # progressed sometimes preserves levels_completed instead of returning to 0
+    # (verified locally on cn04 — single reset returns levels=1 if env was
+    # last left at level 1). A second reset reliably resets. Without this,
+    # cn04-style games whose opening replay actions are fragile at level 1
+    # GAME_OVER immediately and the entire task wastes its budget.
     try:
         raw_obs = env.reset()
+        if getattr(raw_obs, "levels_completed", 0) > 0:
+            raw_obs = env.reset()
     except Exception:
         raw_obs = env.observation_space
     if raw_obs is None:
