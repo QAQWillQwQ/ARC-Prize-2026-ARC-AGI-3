@@ -50,6 +50,7 @@ class EpisodeTransitionDataset(Dataset):
         max_steps: int,
         archetype_map: Optional[Dict[str, int]] = None,
         color_permutation_prob: float = 0.0,
+        max_transitions_per_episode: Optional[int] = None,
     ) -> None:
         self.episodes: List[Dict[str, Any]] = []
         self.sample_index: List[Tuple[int, int]] = []
@@ -57,6 +58,15 @@ class EpisodeTransitionDataset(Dataset):
         self.max_steps = max_steps
         self.num_episodes = 0
         self.archetype_map: Dict[str, int] = dict(archetype_map or {})
+        # Memory cap: when set, only the LAST N transitions of each episode
+        # are kept. The "last N" choice (vs first or stride sampling) is
+        # deliberate — gt_warmstart_partial / heuristic_only episodes hit the
+        # 2000-step max budget and the late transitions contain most of the
+        # progress signal (deeper levels). gt_verbatim / perturbed episodes
+        # are short (avg 572 / 348 actions) so this cap doesn't truncate them.
+        # Stride sampling was rejected because it breaks the consecutive
+        # next_frame relation the latent-prediction loss depends on.
+        self.max_transitions_per_episode = max_transitions_per_episode
         # Per-sample probability of applying a random color permutation to all
         # frames in this sample. 0 disables (default). 0.5 = half of training
         # samples see a randomized palette → forces the model to learn structural
@@ -85,6 +95,14 @@ class EpisodeTransitionDataset(Dataset):
         raw_transitions = list(episode.get("transitions", []))
         if not raw_transitions:
             return False
+        # Memory cap (see __init__ doc): trim to last N transitions if set.
+        # Discards the corresponding _cached_frames_array slice so add_episode
+        # falls back to building the frames tensor from per-transition views.
+        cap = self.max_transitions_per_episode
+        if cap is not None and len(raw_transitions) > cap:
+            raw_transitions = raw_transitions[-cap:]
+            # Invalidate the cached frames array (it was for the full episode)
+            episode = {k: v for k, v in episode.items() if k != "_cached_frames_array"}
         rewards = [transition_reward(transition) for transition in raw_transitions]
         returns = compute_discounted_returns(rewards)
 
@@ -288,6 +306,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth", type=int, default=None)
     parser.add_argument("--num-heads", type=int, default=None)
     parser.add_argument("--max-steps", type=int, default=192)
+    parser.add_argument("--max-transitions-per-episode", type=int, default=None,
+                        help="Cap transitions per episode (keeps the LAST N, where progress happens). "
+                             "Default None = use all. Recommended ~1000 for bc_v2 corpus on 80 GB RAM "
+                             "(memory ~ 4 KB * (N+1) * num_episodes).")
     parser.add_argument("--stall-steps", type=int, default=24)
     parser.add_argument("--reset-limit", type=int, default=4)
     parser.add_argument("--online-val-every", type=int, default=None)
@@ -980,6 +1002,7 @@ def main() -> None:
         max_steps=int(config["max_steps"]),
         archetype_map=archetype_map,
         color_permutation_prob=float(config.get("color_permutation_prob", 0.0)),
+        max_transitions_per_episode=args.max_transitions_per_episode,
     )
     # Val dataset uses the natural color distribution so val metrics are
     # comparable across runs — augmentation is a train-time-only regularizer.
@@ -989,6 +1012,7 @@ def main() -> None:
         max_steps=int(config["max_steps"]),
         archetype_map=archetype_map,
         color_permutation_prob=0.0,
+        max_transitions_per_episode=args.max_transitions_per_episode,
     )
     loaded_episodes = 0
     for episode in iter_episodes_from_paths(data_paths, allowed_games=requested_games):
