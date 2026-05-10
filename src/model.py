@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from .common import ACTION_IDS, NUM_COLORS
@@ -106,6 +107,25 @@ class ObjectCentricPolicy(nn.Module):
         )
 
     def encode_state(self, obs: torch.Tensor, scalar: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # Accept either raw color indices or pre-encoded one-hot frames so the
+        # model is backward-compatible with PolicyGuidedAgent (which calls
+        # `one_hot_frames` on CPU before model forward) AND with the optimized
+        # training path (which ships uint8 frames and lets the GPU one_hot
+        # them — eliminates the dominant CPU cost in the DataLoader workers).
+        #
+        # Detection rule: obs with channel-dim == self.history*16 is already
+        # one-hot encoded float32; obs with channel-dim == self.history is raw.
+        # Both shapes are (B, C, 64, 64).
+        if obs.dim() == 4 and obs.shape[1] == self.history:
+            # Raw color indices path: one_hot on GPU, much faster than CPU.
+            clipped = obs.to(dtype=torch.long).clamp_(0, NUM_COLORS - 1)
+            # (B, history, 64, 64) -> (B, history, 64, 64, NUM_COLORS) -> (B, history*NUM_COLORS, 64, 64)
+            one_hot = F.one_hot(clipped, num_classes=NUM_COLORS)
+            obs = one_hot.permute(0, 1, 4, 2, 3).reshape(
+                obs.shape[0], self.history * NUM_COLORS, 64, 64
+            ).to(dtype=torch.float32)
+        elif obs.dtype != torch.float32:
+            obs = obs.to(dtype=torch.float32)
         features = self.conv(obs)
         batch_size = features.shape[0]
         patches = features.flatten(2).transpose(1, 2)

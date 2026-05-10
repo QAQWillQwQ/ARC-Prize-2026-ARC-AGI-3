@@ -242,8 +242,12 @@ class EpisodeTransitionDataset(Dataset):
             next_frame_target = self._zero_next_frame_target
 
         return {
-            "obs": self._encode_history(history_frames),
-            "next_obs": self._encode_history(next_history_frames),
+            # Ship raw uint8 (history, 64, 64) frames; model.encode_state does
+            # the one_hot expansion on GPU. Shrinks per-sample DataLoader
+            # output from ~1 MB float32 (history*16, 64, 64) to ~16 KB uint8 —
+            # 64x less IPC + zero CPU one_hot work in workers.
+            "obs": history_frames.to(dtype=torch.uint8),
+            "next_obs": next_history_frames.to(dtype=torch.uint8),
             "scalar": scalar_features(
                 available_actions=transition["available_actions"],
                 last_action_id=episode["last_action_before"][transition_index],
