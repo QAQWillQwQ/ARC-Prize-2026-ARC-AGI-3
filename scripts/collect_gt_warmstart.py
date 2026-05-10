@@ -93,21 +93,21 @@ from src.common import (  # noqa: E402
 _WORKER_ARC: Optional[Arcade] = None
 _WORKER_ENVS: Dict[str, Any] = {}
 
-# Path A (memory-leak fix): each worker writes full episodes (with transitions)
-# to its OWN gz shard file. Only a tiny per-task summary (no transitions) is
-# returned to the parent. This eliminates the parent-side futures backlog of
-# ~108 MB Python payloads that drove RAM growth from 6 GB → 18 GB in 90s.
-_WORKER_GZ_HANDLE: Optional[Any] = None
+# Path A v2 (corruption fix): instead of a long-lived gzip.open("at") + flush()
+# per write — which produced internally corrupt deflate streams at scale on
+# WSL/NTFS — each worker now writes ONE SELF-CONTAINED gzip member per episode
+# via gzip.compress(line_bytes), appended to a regular binary shard file. Each
+# episode = one independent gzip member; a SIGKILL between episodes can lose
+# at most the in-flight task; concat is a byte-wise append because gzip files
+# are already multi-member by construction. Reading: standard gzip.open()
+# handles multi-member gz transparently.
+_WORKER_GZ_HANDLE: Optional[Any] = None  # binary file (not GzipFile)
 _WORKER_GZ_PATH: Optional[Path] = None
 
 
 def _close_worker_gz() -> None:
-    """atexit hook: flush + close the per-worker gz shard.
-
-    Fires on graceful worker exit (max_tasks_per_child recycle, pool.shutdown,
-    KeyboardInterrupt). Does NOT fire on SIGKILL, but we also flush() after
-    every write below to bound data loss to at most one episode.
-    """
+    """atexit hook: close the per-worker shard file. Each episode was already
+    written as a complete gzip member, so close has no extra work to do."""
     global _WORKER_GZ_HANDLE
     if _WORKER_GZ_HANDLE is not None:
         try:
@@ -125,7 +125,7 @@ def _init_worker(
     shard_dir_str: str,
 ) -> None:
     """ProcessPoolExecutor initializer. Creates one Arcade per worker + opens
-    the per-worker gz shard."""
+    the per-worker shard file (binary append mode)."""
     global _WORKER_ARC, _WORKER_ENVS, _WORKER_GZ_HANDLE, _WORKER_GZ_PATH
     if priors_path_str:
         os.environ.setdefault("ARC_PRIORS_PATH", priors_path_str)
@@ -135,29 +135,31 @@ def _init_worker(
         recordings_dir=str(recordings_dir_str),
     )
     _WORKER_ENVS = {}
-    # Each worker process gets its own shard file keyed by PID. When workers
-    # are recycled (max_tasks_per_child=50), a new PID is assigned and a new
-    # shard file is created — no clobber.
     shard_dir = Path(shard_dir_str)
     shard_dir.mkdir(parents=True, exist_ok=True)
     _WORKER_GZ_PATH = shard_dir / f"shard_{os.getpid()}.jsonl.gz"
-    _WORKER_GZ_HANDLE = gzip.open(_WORKER_GZ_PATH, "at", encoding="utf-8")
+    # Plain binary append — no gzip.open. Each episode produces a complete
+    # gzip member written directly via _write_episode_locally below.
+    _WORKER_GZ_HANDLE = open(_WORKER_GZ_PATH, "ab")
     atexit.register(_close_worker_gz)
 
 
 def _write_episode_locally(payload: Dict[str, Any]) -> bool:
-    """Write one episode line into this worker's gz shard. Returns success.
+    """Append ONE complete gzip member containing this episode's JSON line.
 
-    Each call flushes the gzip stream (Z_SYNC_FLUSH) so a SIGKILL between
-    episodes loses at most the in-flight task. Slight compression-ratio cost
-    (~5%) is acceptable; the alternative is silently losing entire shards.
+    gzip.compress() returns a complete, self-contained gzip stream (header,
+    deflate blocks, footer with CRC + ISIZE). Concatenating multiple such
+    members is the canonical multi-member gzip layout, readable transparently
+    by gzip.open(..., 'rt'). Each call flushes the underlying file so SIGKILL
+    between episodes loses at most the in-flight task.
     """
     global _WORKER_GZ_HANDLE
     if _WORKER_GZ_HANDLE is None:
         return False
     try:
-        _WORKER_GZ_HANDLE.write(json.dumps(payload, ensure_ascii=True))
-        _WORKER_GZ_HANDLE.write("\n")
+        line_bytes = (json.dumps(payload, ensure_ascii=True) + "\n").encode("utf-8")
+        member_bytes = gzip.compress(line_bytes)
+        _WORKER_GZ_HANDLE.write(member_bytes)
         _WORKER_GZ_HANDLE.flush()
         return True
     except Exception:
@@ -903,16 +905,13 @@ def main() -> int:
         "initializer": _init_worker,
         "initargs": (str(project_root), str(recordings_dir), priors_for_init, str(shard_dir)),
     }
-    # max_tasks_per_child=50 (Python 3.11+): worker recycled every 50 tasks
-    # to bound any leaked state in arc_agi internals. 50 is gentle (vs 5 which
-    # caused freezes) — it gives workers enough lifetime to amortize startup
-    # but bounds the memory footprint.
-    try:
-        import inspect as _insp
-        if "max_tasks_per_child" in _insp.signature(ProcessPoolExecutor).parameters:
-            pool_kwargs["max_tasks_per_child"] = 50
-    except Exception:
-        pass
+    # NOTE: do NOT set max_tasks_per_child. It causes a deadlock: with N workers
+    # all started together, all N hit the threshold within the same ~30s window,
+    # all exit cleanly, and ProcessPoolExecutor fails to respawn replacements
+    # (reproduced locally at 800/12425 with N=16 and limit=50). Path A already
+    # eliminates the parent-side memory leak that motivated worker recycling,
+    # and per-worker memory is bounded by the cached-env cap (25) + MyAgent
+    # instances dying per-task + the Arcade being one-shot.
 
     try:
         with ProcessPoolExecutor(**pool_kwargs) as pool:
