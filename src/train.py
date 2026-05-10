@@ -132,10 +132,24 @@ class EpisodeTransitionDataset(Dataset):
         archetype_label = self.archetype_map.get(
             short_id, ARCHETYPE_LABELS["mixed"]
         )
+        # Fast path: if the loader yielded a cached numpy frames array on the
+        # episode dict, use it directly via torch.from_numpy (zero-copy). Else
+        # stack-then-from_numpy avoids the slow torch.tensor(list-of-ndarrays)
+        # path that the warning flagged.
+        cached_frames = episode.get("_cached_frames_array")
+        if cached_frames is not None:
+            frames_tensor = torch.from_numpy(cached_frames).to(dtype=torch.uint8)
+        else:
+            import numpy as _np
+            try:
+                frames_arr = _np.stack(frame_list, axis=0)
+                frames_tensor = torch.from_numpy(frames_arr).to(dtype=torch.uint8)
+            except Exception:
+                frames_tensor = torch.tensor(frame_list, dtype=torch.uint8)
         self.episodes.append(
             {
                 "transitions": transitions,
-                "frames": torch.tensor(frame_list, dtype=torch.uint8),
+                "frames": frames_tensor,
                 "returns": returns,
                 "score": episode_score,
                 "last_action_before": last_action_before,
@@ -357,15 +371,104 @@ def split_episode_keys(keys: Sequence[str], holdout_fraction: float = 0.2) -> Tu
     return train_keys, val_keys
 
 
+def _is_cache_path(path: Path) -> bool:
+    """Cache files end in .pkl.gz; raw episode .gz files end in .jsonl.gz."""
+    name = path.name.lower()
+    return name.endswith(".pkl.gz") or name.endswith(".cache.pkl.gz") or name.endswith(".pkl")
+
+
+def _matches_allowed(game_id: str, allowed: set) -> bool:
+    """Filter helper: episode's game_id is allowed if either the full id or
+    its short prefix (before the first '-') is in the allowed set. Lets users
+    pass --games sp80 and have it match game_id='sp80-589a99af'.
+    """
+    if not allowed:
+        return True
+    if game_id in allowed:
+        return True
+    short = game_id.split("-", 1)[0]
+    return short in allowed
+
+
+def _iter_pkl_cache(path: Path, allowed: set) -> Iterable[Dict[str, Any]]:
+    """Yield episodes from a pre-built pickle cache (scripts/build_train_cache.py).
+
+    Cache format: a CONCATENATED pickle stream — one `pickle.dump(episode, ...)`
+    call per episode. Read with `while: try pickle.load except EOFError: break`.
+    Loads incrementally without materializing the full list in memory, so
+    cache size can exceed available RAM.
+
+    Each cached episode dict has summary fields plus
+    `frames: np.ndarray (N+1, 64, 64) uint8` and `transitions: List[Dict]`.
+    On yield, the compact `frames` array is expanded back into per-transition
+    `frame` / `next_frame` keys (zero-copy numpy views) so the rest of the
+    pipeline (add_episode, transition_reward, etc.) sees the same shape it
+    would from a raw .jsonl.gz parse.
+
+    Falls back to legacy single-pickle-list format if pickle.load returns a
+    list on the first call (covers caches built by the v1 build script).
+    """
+    import gzip as _gz
+    import pickle as _pkl
+    open_fn = (lambda p: _gz.open(p, "rb")) if path.name.lower().endswith(".gz") else (lambda p: open(p, "rb"))
+
+    def _expand(ep: Dict[str, Any]) -> Dict[str, Any]:
+        frames = ep.get("frames")
+        if frames is None:
+            return ep
+        out_episode = {k: v for k, v in ep.items() if k != "frames"}
+        # Pass the full (N+1, 64, 64) array as a single ndarray under a
+        # private key so add_episode can torch.from_numpy() it directly
+        # (zero-copy) instead of rebuilding the tensor from a list of views.
+        out_episode["_cached_frames_array"] = frames
+        new_transitions = []
+        for i, t in enumerate(ep.get("transitions", [])):
+            nt = dict(t)
+            nt["frame"] = frames[i]
+            nt["next_frame"] = frames[i + 1]
+            new_transitions.append(nt)
+        out_episode["transitions"] = new_transitions
+        return out_episode
+
+    with open_fn(path) as f:
+        # Peek at first object — if it's a list, we have a legacy v1 cache.
+        try:
+            first = _pkl.load(f)
+        except EOFError:
+            return
+        if isinstance(first, list):
+            # Legacy: single big list of episodes
+            for ep in first:
+                game_id = str(ep.get("game_id", ""))
+                if not _matches_allowed(game_id, allowed):
+                    continue
+                yield _expand(ep)
+            return
+        # Streaming: first object was already an episode
+        ep = first
+        while True:
+            game_id = str(ep.get("game_id", ""))
+            if _matches_allowed(game_id, allowed):
+                yield _expand(ep)
+            try:
+                ep = _pkl.load(f)
+            except EOFError:
+                break
+
+
 def iter_episodes_from_paths(paths: Sequence[Path | str], allowed_games: Optional[Sequence[str]] = None) -> Iterable[Dict[str, Any]]:
     allowed = set(str(game_id) for game_id in (allowed_games or []))
     for raw_path in paths:
         path = Path(raw_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError("Collected data not found: %s" % path)
+        if _is_cache_path(path):
+            for episode in _iter_pkl_cache(path, allowed):
+                yield episode
+            continue
         for episode in iter_jsonl_gz(path):
             game_id = str(episode.get("game_id", ""))
-            if allowed and game_id not in allowed:
+            if not _matches_allowed(game_id, allowed):
                 continue
             yield episode
 
@@ -376,17 +479,13 @@ def iter_episode_summaries_from_paths(
 ) -> Iterable[Dict[str, Any]]:
     """Fast metadata-only episode iterator for discovery / splitting.
 
-    Skips parsing the giant `transitions` array — yields only the small summary
-    fields (game_id, short_id, source, levels_completed, etc.). ~10x faster
-    than `iter_episodes_from_paths` on bc_v2-style corpora where each episode
-    has a 1500-transition / 50 MB-uncompressed JSON line. Reduces the discover
-    pass on the 4.3 GB bc_v2 corpus from ~30 min to ~3 min.
+    For .pkl.gz cache files: full pickle.load (cheap, ~30s for bc_v2 corpus),
+    yields each episode with its summary fields.
 
-    Implementation: each episode is one JSON object with the summary fields
-    written FIRST and `transitions` LAST (per `collect_gt_warmstart.py`). We
-    slice the first 1024 chars of each line, find `, "transitions":`, truncate
-    there, re-close the dict — gives us a tiny JSON object with only the
-    metadata. Falls back to full parse if the head doesn't contain the marker.
+    For .jsonl.gz raw files: skips parsing the giant `transitions` array.
+    Slices the first 1024 chars of each line, finds `, "transitions":`,
+    truncates, re-closes the dict — gives us a tiny JSON object with only the
+    metadata. ~3x faster than full json.loads on bc_v2-scale corpora.
     """
     import gzip
     import json as _json
@@ -395,6 +494,10 @@ def iter_episode_summaries_from_paths(
         path = Path(raw_path).expanduser().resolve()
         if not path.exists():
             raise FileNotFoundError("Collected data not found: %s" % path)
+        if _is_cache_path(path):
+            for ep in _iter_pkl_cache(path, allowed):
+                yield ep
+            continue
         with gzip.open(path, "rt") as f:
             for raw_line in f:
                 head = raw_line[:1024]
@@ -408,7 +511,7 @@ def iter_episode_summaries_from_paths(
                 except _json.JSONDecodeError:
                     continue
                 game_id = str(ep.get("game_id", ""))
-                if allowed and game_id not in allowed:
+                if not _matches_allowed(game_id, allowed):
                     continue
                 yield ep
 
