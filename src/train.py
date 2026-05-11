@@ -740,7 +740,14 @@ def evaluate_public_score(
         if env is None:
             print("[online-val] skipped game=%s env_unavailable" % game_id, flush=True)
             continue
-        baseline_actions = metadata_map[game_id].get("baseline_actions", [])
+        # metadata_map is keyed by SHORT id (e.g. "cn04"), but online-val
+        # iterates the full discovered game_ids (e.g. "cn04-2fe56bfb"). Try
+        # both forms before giving up.
+        short_id = str(game_id).split("-", 1)[0]
+        meta = metadata_map.get(game_id) or metadata_map.get(short_id) or {}
+        baseline_actions = meta.get("baseline_actions", [])
+        if not baseline_actions:
+            print("[online-val] WARN no baseline_actions for game=%s (tried short=%s)" % (game_id, short_id), flush=True)
         result = agent.play_env(env=env, game_id=game_id, baseline_actions=baseline_actions)
         score_info = rhae_score(
             baseline_actions=baseline_actions,
