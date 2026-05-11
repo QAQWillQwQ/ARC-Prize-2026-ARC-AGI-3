@@ -31,8 +31,6 @@ That run produced:
 
 ### Top 6 Best Result Games' Annotated GIFs
 
-To make the GitHub README render correctly, I copied the annotated GIFs into `docs/gifs/openlab_collect_best_v3/`.
-
 ar25: best level 2, score 8.333, 128 actions
 
 ![ar25 best level 2](docs/gifs/openlab_collect_best_v3/ar25_best_level2_128_actions.gif)
