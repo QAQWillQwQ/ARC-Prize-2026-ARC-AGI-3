@@ -1,0 +1,14 @@
+{
+  "id": "jihangli1121/arc-agi-3-goose-t2",
+  "title": "ARC AGI 3 Goose T2",
+  "code_file": "kaggle_submission.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["arc-prize-2026-arc-agi-3"],
+  "kernel_sources": [],
+  "model_sources": []
+}

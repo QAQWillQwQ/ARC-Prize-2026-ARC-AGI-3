@@ -48,6 +48,16 @@ from arcengine import FrameData, GameAction, GameState
 
 from agents.agent import Agent
 
+# v4.3 TTT: try-import the vendored BC policy + TTT primitives. Fail-soft so
+# the agent still runs without torch (e.g., during pure-replay smoke tests).
+try:
+    import bc_policy as _bc_policy
+    _BC_POLICY_OK = True
+except Exception as _bc_exc:
+    _bc_policy = None  # type: ignore
+    _BC_POLICY_OK = False
+    print(f"[MyAgent] bc_policy import failed (TTT disabled): {_bc_exc}", flush=True)
+
 
 REPLAY_BASE_DIR = Path(os.environ.get('ARC_REPLAY_BASE_DIR', '/kaggle/working/replays'))
 WALL_BUDGET_SECONDS = 12 * 3600 - 5 * 60  # 12h - 5min safety margin
@@ -359,6 +369,225 @@ def _build_edge_sweep_points() -> List[Tuple[int, int]]:
 EDGE_SWEEP_POINTS: Tuple[Tuple[int, int], ...] = tuple(_build_edge_sweep_points())
 
 
+# ---------------------- action-effect retrieval dictionary ----------------------
+# Ported from src/action_effect_dict.py (load-only, no build path).
+# Provides a cosine-similarity kNN lookup over ~15k GT replay transitions:
+# given the current frame and a candidate (action_id, x, y), returns the
+# typical frame_delta + level_prob + similarity. v4 hidden-mode strategies
+# blend this into _score_action_candidate so coord/key picks bias toward
+# the kind of moves the human demonstrators made productively.
+
+try:
+    import numpy as _np  # type: ignore
+    _NUMPY_OK = True
+except Exception:
+    _np = None  # type: ignore
+    _NUMPY_OK = False
+
+
+_FEATURE_GRID = 64
+_FEATURE_QUAD = 4
+_FEATURE_NUM_COLORS = 16
+_FEATURE_DIM = _FEATURE_QUAD * _FEATURE_QUAD * _FEATURE_NUM_COLORS  # 256
+
+
+def _compute_feature_key(frame: Sequence[Sequence[int]]) -> Optional["_np.ndarray"]:
+    """256-d per-quadrant color-histogram feature for a 64x64 frame."""
+    if not _NUMPY_OK:
+        return None
+    try:
+        arr = _np.asarray(frame, dtype=_np.int32)
+        if arr.shape != (_FEATURE_GRID, _FEATURE_GRID):
+            out = _np.zeros((_FEATURE_GRID, _FEATURE_GRID), dtype=_np.int32)
+            h = min(arr.shape[0], _FEATURE_GRID) if arr.ndim >= 1 else 0
+            w = min(arr.shape[1], _FEATURE_GRID) if arr.ndim >= 2 else 0
+            if h and w:
+                out[:h, :w] = arr[:h, :w]
+            arr = out
+        quad = _FEATURE_GRID // _FEATURE_QUAD  # 16
+        feat = _np.zeros((_FEATURE_QUAD, _FEATURE_QUAD, _FEATURE_NUM_COLORS), dtype=_np.float32)
+        for qy in range(_FEATURE_QUAD):
+            for qx in range(_FEATURE_QUAD):
+                patch = arr[qy * quad:(qy + 1) * quad, qx * quad:(qx + 1) * quad]
+                patch_flat = _np.clip(patch.ravel(), 0, _FEATURE_NUM_COLORS - 1)
+                counts = _np.bincount(patch_flat, minlength=_FEATURE_NUM_COLORS).astype(_np.float32)
+                total = counts.sum()
+                if total > 0:
+                    counts /= total
+                feat[qy, qx] = counts
+        return feat.reshape(_FEATURE_DIM)
+    except Exception:
+        return None
+
+
+class ActionEffectDictionary:
+    """In-memory kNN retrieval over GT-replay (frame, action) → effect."""
+
+    def __init__(
+        self,
+        feature_keys: "_np.ndarray",
+        action_ids: "_np.ndarray",
+        xs: "_np.ndarray",
+        ys: "_np.ndarray",
+        frame_deltas: "_np.ndarray",
+        level_progresses: "_np.ndarray",
+        game_id_idx: "_np.ndarray",
+        game_ids: List[str],
+    ) -> None:
+        norms = _np.linalg.norm(feature_keys, axis=1, keepdims=True)
+        norms = _np.where(norms < 1e-8, 1.0, norms)
+        self.feature_keys = (feature_keys / norms).astype(_np.float32)
+        self.action_ids = action_ids.astype(_np.int8)
+        self.xs = xs.astype(_np.int8)
+        self.ys = ys.astype(_np.int8)
+        self.frame_deltas = frame_deltas.astype(_np.int32)
+        self.level_progresses = level_progresses.astype(_np.int8)
+        self.game_id_idx = game_id_idx.astype(_np.int16)
+        self.game_ids = list(game_ids)
+        self._action_masks: Dict[int, "_np.ndarray"] = {}
+        for aid in range(1, 8):
+            self._action_masks[aid] = (self.action_ids == aid)
+
+    def __len__(self) -> int:
+        return int(self.feature_keys.shape[0])
+
+    def lookup(
+        self,
+        action_id: int,
+        x: int = 0,
+        y: int = 0,
+        k: int = 5,
+        coord_tolerance: int = 4,
+        precomputed_query: Optional["_np.ndarray"] = None,
+    ) -> Dict[str, float]:
+        """Returns {'mean_delta', 'level_prob', 'n_matches', 'similarity'}.
+
+        `precomputed_query` MUST be supplied (call `_compute_feature_key` once
+        per frame and pass it here for every candidate). The frame argument is
+        intentionally absent — recomputing the feature per candidate would
+        dominate runtime.
+        """
+        zero_result = {"mean_delta": 0.0, "level_prob": 0.0, "n_matches": 0, "similarity": 0.0}
+        if precomputed_query is None:
+            return zero_result
+        mask = self._action_masks.get(int(action_id))
+        if mask is None or not mask.any():
+            return zero_result
+        if int(action_id) == 6:
+            coord_mask = mask & (
+                (_np.abs(self.xs.astype(_np.int32) - int(x)) <= coord_tolerance)
+                & (_np.abs(self.ys.astype(_np.int32) - int(y)) <= coord_tolerance)
+            )
+            if coord_mask.any():
+                mask = coord_mask
+        n_matches = int(mask.sum())
+        if n_matches == 0:
+            return zero_result
+        candidate_idxs = _np.where(mask)[0]
+        sims = self.feature_keys[candidate_idxs] @ precomputed_query
+        if sims.size == 0:
+            return zero_result
+        k_actual = min(k, sims.size)
+        if k_actual <= 0:
+            return zero_result
+        top_local = _np.argpartition(-sims, k_actual - 1)[:k_actual]
+        top_global = candidate_idxs[top_local]
+        return {
+            "mean_delta": float(self.frame_deltas[top_global].mean()),
+            "level_prob": float(self.level_progresses[top_global].mean()),
+            "n_matches": n_matches,
+            "similarity": float(sims[top_local].mean()),
+        }
+
+    def top_clicks_by_similarity(
+        self,
+        query: "_np.ndarray",
+        k: int = 10,
+        prefer_progress: bool = True,
+    ) -> List[Tuple[int, int]]:
+        """Return up to `k` distinct ACTION6 coords from the most-similar
+        dict entries to `query`. If `prefer_progress`, restrict to entries
+        that produced level progress when at least k such entries exist;
+        otherwise fall back to highest-similarity entries.
+        """
+        a6_mask = self._action_masks.get(6)
+        if a6_mask is None or not a6_mask.any():
+            return []
+        if prefer_progress:
+            prog_mask = a6_mask & (self.level_progresses > 0)
+            if int(prog_mask.sum()) >= k:
+                a6_mask = prog_mask
+        a6_idxs = _np.where(a6_mask)[0]
+        sims = self.feature_keys[a6_idxs] @ query
+        if sims.size == 0:
+            return []
+        scan_k = min(k * 4, sims.size)
+        top_local = _np.argpartition(-sims, scan_k - 1)[:scan_k]
+        top_global = a6_idxs[top_local]
+        # Dedup while preserving similarity-rank order.
+        order = _np.argsort(-sims[top_local])
+        seen: set = set()
+        out: List[Tuple[int, int]] = []
+        for j in order:
+            i = int(top_global[int(j)])
+            xy = (int(self.xs[i]), int(self.ys[i]))
+            if xy in seen:
+                continue
+            seen.add(xy)
+            out.append(xy)
+            if len(out) >= k:
+                break
+        return out
+
+    @classmethod
+    def load(cls, path: Path) -> "ActionEffectDictionary":
+        z = _np.load(path, allow_pickle=True)
+        return cls(
+            feature_keys=z["feature_keys"],
+            action_ids=z["action_ids"],
+            xs=z["xs"],
+            ys=z["ys"],
+            frame_deltas=z["frame_deltas"],
+            level_progresses=z["level_progresses"],
+            game_id_idx=z["game_id_idx"],
+            game_ids=list(z["game_ids"].tolist()),
+        )
+
+
+def _load_action_effect_dict() -> Optional[ActionEffectDictionary]:
+    """Try multiple paths for action_effect_dict.npz. Returns None on any failure.
+
+    Set `ARC_DISABLE_EFFECT_DICT=1` to short-circuit and return None — useful
+    for A/B comparing v4 (heuristic only) against v4.1 (heuristic + dict).
+    """
+    if not _NUMPY_OK:
+        return None
+    if str(os.environ.get('ARC_DISABLE_EFFECT_DICT', '')).strip() in ('1', 'true', 'TRUE', 'yes'):
+        print('[MyAgent] effect_dict disabled via ARC_DISABLE_EFFECT_DICT env var', flush=True)
+        return None
+    candidates = [
+        os.environ.get('ARC_EFFECT_DICT_PATH'),
+        str(REPLAY_BASE_DIR.parent / 'action_effect_dict.npz'),
+        str(REPLAY_BASE_DIR.parent / 'Local_Output' / 'action_effect_dict.npz'),
+        '/kaggle/working/action_effect_dict.npz',
+        '/kaggle/working/replays/action_effect_dict.npz',
+        '/kaggle/input/arc-agi-3-replays-v1/action_effect_dict.npz',
+    ]
+    for path_str in candidates:
+        if not path_str:
+            continue
+        p = Path(path_str)
+        if p.is_file():
+            try:
+                d = ActionEffectDictionary.load(p)
+                print(f'[MyAgent] effect_dict loaded ({len(d)} entries) from {p}', flush=True)
+                return d
+            except Exception as exc:
+                print(f'[MyAgent] effect_dict load failed at {p}: {exc}', flush=True)
+                continue
+    return None
+
+
 # ---------------------- main agent ----------------------
 
 
@@ -376,13 +605,33 @@ class MyAgent(Agent):
         'edge_sweep',
         'color_targeted',
         'action_id_sweep',
+        # v4.2 additions — dict-driven exploit strategies. Inserted AFTER the
+        # original 7 so existing rotation order + cross-attempt exploit memory
+        # in _advance_strategy keep working unchanged.
+        'dict_top_k_pursuit',      # idx 7 — click_dominant exploit
+        'keyboard_dict_sweep',     # idx 8 — keyboard_dominant exploit
     )
 
     # Map archetype string (from per_game_priors) -> starting strategy_idx.
+    # v4.2: archetype defaults updated to the new dict-driven strategies when
+    # the dict is loaded — they're more focused exploit modes than the
+    # explore-heavy click_grid / directional_sustained. _resolve_archetype_strategy
+    # handles the dict-vs-no-dict branch at __init__ time.
     ARCHETYPE_TO_STRATEGY_IDX: Dict[str, int] = {
         'mixed': 0,
         'click_dominant': 2,
         'keyboard_dominant': 3,
+    }
+    # v4.2 hidden-mode A/B at 1000 steps showed dict_top_k_pursuit as the
+    # initial strategy regresses on click-dominant games (too greedy for the
+    # short budget — commits to one coord for 3+ visits before rotating).
+    # Reverted to click_grid / directional_sustained as initial picks; the
+    # new strategies stay in the rotation via _advance_strategy and become
+    # active later in the cycle when click_grid has already explored.
+    ARCHETYPE_TO_STRATEGY_IDX_DICT: Dict[str, int] = {
+        'mixed': 0,
+        'click_dominant': 2,        # click_grid (was 7 dict_top_k_pursuit)
+        'keyboard_dominant': 3,     # directional_sustained (was 8 keyboard_dict_sweep)
     }
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -399,11 +648,33 @@ class MyAgent(Agent):
         # fall back to transfer-learning resolution at first choose_action
         # (we need the first frame, which arrives via the framework loop).
         self._all_priors = _load_per_game_priors()
+        self._effect_dict: Optional[ActionEffectDictionary] = _load_action_effect_dict()
+        # Per-frame feature-vector cache. Keyed by id(latest_frame) so we
+        # compute the 256-d query feature only once per choose_action call.
+        self._cached_query_key: Optional[int] = None
+        self._cached_query_vec: Optional[Any] = None  # numpy array or None
         self._game_prior: Dict[str, Any] = self._all_priors.get(self._short_id, {})
         self._is_hidden_game = not bool(self._game_prior)
         self._transfer_resolved = False  # set True once we attempt resolution
         archetype = str(self._game_prior.get('archetype', 'mixed'))
-        self._initial_strategy_idx = self.ARCHETYPE_TO_STRATEGY_IDX.get(archetype, 0)
+        # v4.2: when dict is loaded, prefer the dict-driven strategy for the
+        # archetype's exploit slot. Falls back to the v3/v4 strategy when
+        # the dict is missing.
+        archetype_map = (
+            self.ARCHETYPE_TO_STRATEGY_IDX_DICT if self._effect_dict is not None
+            else self.ARCHETYPE_TO_STRATEGY_IDX
+        )
+        self._initial_strategy_idx = archetype_map.get(archetype, 0)
+        # v4.4 random-first bias rate (see _advance_strategy). Hidden-only by
+        # default. Override via env ARC_RANDOM_FIRST_BIAS=0.5 (or any 0..1).
+        # 0.0 disables, 1.0 always picks random_full on reset.
+        try:
+            self._random_first_bias = float(os.environ.get(
+                'ARC_RANDOM_FIRST_BIAS',
+                '0.5' if self._is_hidden_game else '0.0',
+            ))
+        except (TypeError, ValueError):
+            self._random_first_bias = 0.5 if self._is_hidden_game else 0.0
 
         # Phase B (post-replay / hidden-game fallback) state.
         self._post_replay_reset_count = 0
@@ -430,6 +701,56 @@ class MyAgent(Agent):
         self._color_targeted_color_idx: int = 0
         self._action_id_sweep_idx: int = 0                    # which available action we're cycling on
         self._action_id_sweep_count: int = 0                  # repeats so far for current action
+
+        # v4.2 #1: coord-visit memory. Persists across GAME_OVER resets so the
+        # agent stops re-clicking the same dead coords cycle after cycle.
+        # Cleared only on level-clear (forward progress).
+        from collections import Counter, deque
+        self._clicked_points: Counter = Counter()             # exact (x, y) visit count
+        self._clicked_bins: Counter = Counter()               # (x//8, y//8) visit count
+        # v4.2 #2: frame-hash novelty memory. Rolling window of post-action
+        # frame hashes; when novelty rate < 0.3 the strategy switcher forces
+        # a rotation to break the cycle.
+        self._seen_frame_hashes: "deque" = deque(maxlen=200)
+        self._novelty_window_actions: int = 0
+        self._novelty_window_nonnovel: int = 0
+        # v4.2 #4: dict_top_k_pursuit cursor state.
+        self._pursuit_pool: List[Tuple[int, int]] = []        # current top-k coords from dict
+        self._pursuit_cursor: int = 0                          # which coord we're committing to
+        self._pursuit_max_visits: int = 3                      # rotate when this coord visited > N
+        self._pursuit_actions_since_refresh: int = 0          # frames between pool rebuilds
+        self._pursuit_refresh_interval: int = 20              # rebuild pool every N pursuit actions
+        # v4.2 #5: keyboard_dict_sweep state — like directional_sustained but
+        # picks the action with the highest dict score per available set.
+        self._kbd_dict_aid: Optional[int] = None
+        self._kbd_dict_remaining: int = 0
+        # v4.3 TTT: load BC checkpoint (lazy — only if bc_policy is available
+        # AND a checkpoint can be found). Run TTT once before first action of
+        # this game (after we know whether replays are available).
+        self._policy: Any = None
+        self._policy_loaded: bool = False
+        self._ttt_done: bool = False
+        # v4.3 TTT (Gen 1 enhancement): rolling buffer of (history_frames, action,
+        # next_frame) triples captured during the agent's first ~30 actions in
+        # the game. Used by ttt_rollout_finetune to adapt the encoder to actual
+        # game dynamics. Triggered at TTT_ROLLOUT_TRIGGER_STEP via choose_action.
+        from collections import deque as _deque
+        self._rollout_buffer_history: List[List[List[List[int]]]] = []
+        self._rollout_buffer_actions: List[Dict[str, Any]] = []
+        self._rollout_buffer_next_frames: List[List[List[int]]] = []
+        self._rollout_ttt_done: bool = False
+        self.TTT_ROLLOUT_TRIGGER_STEP = 30
+        self.TTT_ROLLOUT_BUFFER_MAX = 50
+        ttt_disabled = str(os.environ.get('ARC_DISABLE_TTT', '')).strip() in ('1', 'true', 'TRUE', 'yes')
+        if _BC_POLICY_OK and not ttt_disabled:
+            ckpt_path = _bc_policy.find_checkpoint()
+            if ckpt_path is not None:
+                self._policy = _bc_policy.PolicyHelper.load(ckpt_path)
+                self._policy_loaded = self._policy is not None
+            else:
+                print('[MyAgent] no BC checkpoint found; TTT disabled', flush=True)
+        elif ttt_disabled:
+            print('[MyAgent] TTT disabled via ARC_DISABLE_TTT env var', flush=True)
 
         prior_summary = (
             f"archetype={archetype} click_ratio={self._game_prior.get('click_ratio', '?')}"
@@ -626,12 +947,40 @@ class MyAgent(Agent):
             flush=True,
         )
 
+    @staticmethod
+    def _frame_hash_str(frame: Sequence[Sequence[int]]) -> str:
+        """Stable hash of a 64x64 frame. Uses bytes of the flattened uint8
+        array — fast (~50us) and collision-safe for our 16-color, 4096-cell
+        grids. Falls back to Python hash() on any frame-shape oddity.
+        """
+        try:
+            if _NUMPY_OK:
+                arr = _np.asarray(frame, dtype=_np.uint8)
+                return arr.tobytes().hex()
+            # Numpy-less fallback (Kaggle always has numpy; this is just defensive).
+            flat = []
+            for row in frame:
+                for c in row:
+                    flat.append(int(c))
+            return repr(tuple(flat))
+        except Exception:
+            try:
+                return repr(frame)
+            except Exception:
+                return ""
+
     def _record_last_action_effect(self, frames: List[FrameData], latest_frame: FrameData) -> None:
         """If we have a previous frame and a previously-returned action,
         compute frame_delta and update the online action-effects map.
 
         Also bumps the freeze streak (consecutive zero-delta steps) used by
         choose_action's freeze-detection branch.
+
+        v4.2 #1: also records the click coord into _clicked_points / _clicked_bins
+        so future scoring can penalize re-visits across resets.
+        v4.2 #2: also hashes the post-action frame and tracks novelty rate
+        in a 200-step window. choose_action consults the rate to force
+        strategy switches when cycling.
         """
         if self._last_returned_action is None or len(frames) < 2:
             return
@@ -657,6 +1006,9 @@ class MyAgent(Agent):
             except Exception:
                 x, y = 0, 0
             key = (6, x // 8, y // 8)
+            # v4.2 #1: cross-attempt coord visit memory (only for ACTION6).
+            self._clicked_points[(x, y)] += 1
+            self._clicked_bins[(x // 8, y // 8)] += 1
         else:
             key = (aid, 0, 0)
         c, m = self._action_effects.get(key, (0, 0.0))
@@ -664,14 +1016,271 @@ class MyAgent(Agent):
         m_new = m + (delta - m) / n_new
         self._action_effects[key] = (n_new, m_new)
 
-    def _score_action_candidate(self, action_id: int, x: int = 0, y: int = 0) -> float:
+        # v4.2 #2: post-action frame-hash novelty.
+        h = self._frame_hash_str(cur)
+        self._novelty_window_actions += 1
+        if h and h in self._seen_frame_hashes:
+            self._novelty_window_nonnovel += 1
+        if h:
+            self._seen_frame_hashes.append(h)
+        # Periodic window reset to avoid stale rates after major progress.
+        if self._novelty_window_actions >= 100:
+            self._novelty_window_actions = 0
+            self._novelty_window_nonnovel = 0
+
+    def _on_level_clear(self) -> None:
+        """v4.2: clear the visit/novelty memories on real progress so the
+        agent doesn't keep penalizing coords that worked. Called from
+        choose_action when current_levels > _last_levels_seen.
+        """
+        if self._clicked_points:
+            self._clicked_points.clear()
+        if self._clicked_bins:
+            self._clicked_bins.clear()
+        self._seen_frame_hashes.clear()
+        self._novelty_window_actions = 0
+        self._novelty_window_nonnovel = 0
+
+    def _do_ttt_once(self, latest_frame: FrameData) -> None:
+        """Stage 1 TTT — runs ONCE before first action.
+
+        Only fires `replay_finetune` if we have a GT replay (public games).
+        For hidden games, this is a no-op — wait for `_do_rollout_ttt` at
+        TTT_ROLLOUT_TRIGGER_STEP after we've collected real (s, a, s') pairs.
+        """
+        if self._ttt_done or not self._policy_loaded or self._policy is None:
+            return
+        self._ttt_done = True
+        try:
+            if self._replay:
+                t0 = time.time()
+                stats_a = _bc_policy.ttt_replay_finetune(
+                    self._policy, self._replay, n_steps=30, batch_size=8, lr=1e-4,
+                )
+                print(
+                    f'[MyAgent] {self._short_id} TTT replay_finetune: '
+                    f'steps={stats_a.get("steps",0)} '
+                    f'first_loss={stats_a.get("first_loss",0):.3f} '
+                    f'final_loss={stats_a.get("final_loss",0):.3f} '
+                    f'n_actions={stats_a.get("n_actions",0)} '
+                    f'wall={time.time()-t0:.2f}s',
+                    flush=True,
+                )
+            else:
+                print(
+                    f'[MyAgent] {self._short_id} TTT replay skipped (no replay); '
+                    f'will run rollout TTT at step {self.TTT_ROLLOUT_TRIGGER_STEP}',
+                    flush=True,
+                )
+        except Exception as exc:
+            print(f'[MyAgent] {self._short_id} TTT replay failed (continuing): {exc}', flush=True)
+            traceback.print_exc()
+
+    def _do_rollout_ttt(self, latest_frame: FrameData) -> None:
+        """Stage 2 TTT — runs ONCE at TTT_ROLLOUT_TRIGGER_STEP using buffered rollout.
+
+        Adapts the model to the actual game dynamics observed during the first
+        30 actions. Uses ttt_rollout_finetune (action CE + coord CE + next-frame
+        recon CE). No-op if buffer is too small or policy isn't loaded.
+        """
+        if self._rollout_ttt_done or not self._policy_loaded or self._policy is None:
+            return
+        if len(self._rollout_buffer_actions) < 8:  # need at least one batch
+            return
+        self._rollout_ttt_done = True
+        try:
+            t0 = time.time()
+            stats = _bc_policy.ttt_rollout_finetune(
+                self._policy,
+                history_buffer=self._rollout_buffer_history,
+                action_buffer=self._rollout_buffer_actions,
+                next_frame_buffer=self._rollout_buffer_next_frames,
+                goal_frame=None,  # Gen 2: predict goal from rollout
+                n_steps=30, batch_size=8, lr=5e-5,
+            )
+            print(
+                f'[MyAgent] {self._short_id} TTT rollout_finetune: '
+                f'steps={stats.get("steps",0)} '
+                f'first_loss={stats.get("first_loss",0):.3f} '
+                f'final_loss={stats.get("final_loss",0):.3f} '
+                f'n_pairs={stats.get("n_pairs",0)} '
+                f'wall={time.time()-t0:.2f}s',
+                flush=True,
+            )
+            # Drop the buffer to free memory; we won't re-trigger this generation.
+            self._rollout_buffer_history = []
+            self._rollout_buffer_actions = []
+            self._rollout_buffer_next_frames = []
+        except Exception as exc:
+            print(f'[MyAgent] {self._short_id} TTT rollout failed (continuing): {exc}', flush=True)
+            traceback.print_exc()
+
+    def _capture_rollout_pair(self, frames: List[FrameData], latest_frame: FrameData) -> None:
+        """Record (history, last_action, next_frame) into the rollout buffer.
+
+        Called from choose_action right BEFORE picking the next action so we
+        capture the result of the LAST returned action.
+        """
+        if (self._rollout_ttt_done
+                or not self._policy_loaded
+                or self._last_returned_action is None
+                or len(frames) < 2):
+            return
+        if len(self._rollout_buffer_actions) >= self.TTT_ROLLOUT_BUFFER_MAX:
+            return
+        try:
+            prev_history = self._collect_recent_frames(latest_frame)
+            cur_grid = _flatten_frame(getattr(latest_frame, 'frame', None))
+            if not prev_history or cur_grid is None:
+                return
+            try:
+                aid = int(self._last_returned_action.value if hasattr(self._last_returned_action, 'value') else 0)
+            except Exception:
+                aid = 0
+            if aid == 0 or aid > 7:
+                return  # Skip RESET / invalid
+            x, y = 0, 0
+            if aid == 6:
+                try:
+                    d = self._last_returned_action.action_data.model_dump() if hasattr(self._last_returned_action.action_data, 'model_dump') else (self._last_returned_action.action_data or {})
+                    x = int((d or {}).get('x', 0)); y = int((d or {}).get('y', 0))
+                except Exception:
+                    pass
+            self._rollout_buffer_history.append([list(map(list, f)) for f in prev_history])
+            self._rollout_buffer_actions.append({"action_id": aid, "action_data": {"x": x, "y": y} if aid == 6 else {}})
+            self._rollout_buffer_next_frames.append([list(row) for row in cur_grid])
+        except Exception:
+            pass
+
+    def _collect_recent_frames(self, latest_frame: FrameData) -> List[List[List[int]]]:
+        """Pull the last `history` frames as raw List[List[int]] grids."""
+        history = self._policy.history if self._policy is not None else 4
+        out: List[List[List[int]]] = []
+        for f in self.frames[-history:]:
+            grid = _flatten_frame(getattr(f, 'frame', None))
+            if grid is not None:
+                out.append(grid)
+        if not out:
+            cur = _flatten_frame(getattr(latest_frame, 'frame', None))
+            if cur is not None:
+                out.append(cur)
+        return out
+
+    def _policy_score_current(self, latest_frame: FrameData) -> Optional[Dict[str, Any]]:
+        """One BC forward pass for the current frame. Returns None when policy
+        isn't loaded or scoring fails. Caches by id(latest_frame) so multiple
+        candidate evaluations in one choose_action don't repeat the forward.
+        """
+        if not self._policy_loaded or self._policy is None:
+            return None
+        key = id(latest_frame)
+        cached = getattr(self, '_policy_score_cache_key', None)
+        if cached == key:
+            return getattr(self, '_policy_score_cache_value', None)
+        history = self._collect_recent_frames(latest_frame)
+        cur_frame = _flatten_frame(getattr(latest_frame, 'frame', None))
+        if cur_frame is None or not history:
+            return None
+        scores = self._policy.score_frame(
+            history_frames=history,
+            latest_frame=cur_frame,
+            last_action_id=None,
+            levels_completed=int(getattr(latest_frame, 'levels_completed', 0) or 0),
+            steps_since_progress=int(self._frozen_streak),
+            step_index=int(getattr(self, 'action_counter', 0) or 0),
+            available_actions=_available_action_ids(latest_frame),
+        )
+        self._policy_score_cache_key = key
+        self._policy_score_cache_value = scores
+        return scores
+
+    def _novelty_rate(self) -> float:
+        """Fraction of the last window's transitions that produced a novel
+        post-action frame. 1.0 = all novel; 0.0 = all repeats. Returns 1.0
+        until at least 20 transitions have been recorded.
+        """
+        if self._novelty_window_actions < 20:
+            return 1.0
+        return 1.0 - (self._novelty_window_nonnovel / max(1, self._novelty_window_actions))
+
+    def _get_current_query_vec(self, latest_frame: FrameData) -> Optional[Any]:
+        """Compute (and cache) the 256-d query feature for `latest_frame`.
+
+        Cached by id(latest_frame) so callers can hit it once per
+        `choose_action`. Returns None when numpy is unavailable, the dict
+        isn't loaded, or the frame can't be decoded.
+        """
+        if self._effect_dict is None or not _NUMPY_OK:
+            return None
+        key = id(latest_frame)
+        if key == self._cached_query_key:
+            return self._cached_query_vec
+        self._cached_query_key = key
+        self._cached_query_vec = None
+        frame = _flatten_frame(getattr(latest_frame, 'frame', None))
+        if frame is None:
+            return None
+        feat = _compute_feature_key(frame)
+        if feat is None:
+            return None
+        n = float(_np.linalg.norm(feat))
+        if n < 1e-8:
+            return None
+        self._cached_query_vec = (feat / n).astype(_np.float32)
+        return self._cached_query_vec
+
+    def _dict_lookup_score(
+        self,
+        action_id: int,
+        x: int,
+        y: int,
+        latest_frame: FrameData,
+    ) -> float:
+        """Score in [0.0, 1.0] from action-effect dict kNN lookup.
+
+        Blends three signals:
+          - mean_delta normalized (>50 px change is "did something")
+          - level_prob × 10 (any positive level rate is a strong bias)
+          - cosine similarity (top-k closeness to query frame)
+
+        Returns 0.0 when dict is missing, query can't be computed, or no
+        matches were found for this (action_id, coord) query.
+        """
+        if self._effect_dict is None:
+            return 0.0
+        qv = self._get_current_query_vec(latest_frame)
+        if qv is None:
+            return 0.0
+        try:
+            res = self._effect_dict.lookup(int(action_id), int(x), int(y), k=5, precomputed_query=qv)
+        except Exception:
+            return 0.0
+        if int(res.get('n_matches', 0)) == 0:
+            return 0.0
+        delta_norm = min(1.0, float(res['mean_delta']) / 50.0)
+        level_bonus = min(1.0, float(res['level_prob']) * 10.0)
+        sim = max(0.0, min(1.0, float(res['similarity'])))
+        return 0.4 * delta_norm + 0.5 * level_bonus + 0.1 * sim
+
+    def _score_action_candidate(
+        self,
+        action_id: int,
+        x: int = 0,
+        y: int = 0,
+        latest_frame: Optional[FrameData] = None,
+    ) -> float:
         """Online action-effect score for a candidate. Used by click_grid and
         directional_sustained re-rankings.
 
-        Score in [0.1, 1.0]:
+        Online score in [0.1, 1.0]:
           - 1.0  → never tried (explore)
           - 0.1  → tried but mean delta < 1 pixel (known dead — strongly avoid)
           - else → mean_delta normalized, capped at 1.0
+
+        When `latest_frame` is provided AND the action-effect dict is loaded,
+        blends a dict-based prior into the score (50/50 by default). The
+        dict signal lifts both new candidates (no online data yet) and
+        re-confirms productive coords the demonstrators used.
         """
         if int(action_id) == 6:
             key = (6, int(x) // 8, int(y) // 8)
@@ -679,10 +1288,57 @@ class MyAgent(Agent):
             key = (int(action_id), 0, 0)
         count, mean_delta = self._action_effects.get(key, (0, 0.0))
         if count == 0:
-            return 1.0
-        if mean_delta < 1.0:
-            return 0.1
-        return min(1.0, mean_delta / 10.0)
+            online_score = 1.0
+        elif mean_delta < 1.0:
+            online_score = 0.1
+        else:
+            online_score = min(1.0, mean_delta / 10.0)
+
+        if latest_frame is None or self._effect_dict is None:
+            blended = online_score
+        else:
+            dict_score = self._dict_lookup_score(action_id, x, y, latest_frame)
+            if dict_score <= 0.0:
+                # No retrieved evidence — defer fully to online signal.
+                blended = online_score
+            elif count == 0:
+                # Never tried — dict prior dominates.
+                blended = 0.3 * online_score + 0.7 * dict_score
+            else:
+                # Sampled — online signal dominates with dict still influencing.
+                blended = 0.6 * online_score + 0.4 * dict_score
+
+        # v4.3 TTT: blend BC policy score (post-adaptation) into the candidate
+        # ranking. The TTT-adapted model is per-game specialized, so it can
+        # contribute meaningful per-action and per-coord guidance even on
+        # hidden games. Weight 0.3 — significant but not overwhelming.
+        if latest_frame is not None and self._policy_loaded and _BC_POLICY_OK:
+            scores = self._policy_score_current(latest_frame)
+            if scores is not None:
+                aid_idx = _bc_policy.ACTION_TO_INDEX.get(int(action_id))
+                if aid_idx is not None:
+                    policy_action = float(scores['action_scores'][aid_idx])
+                    if int(action_id) == 6:
+                        policy_coord = float(scores['x_scores'][int(x)] * scores['y_scores'][int(y)] * 64.0)
+                        # x_scores * y_scores is in [0, 1/64²] so × 64 normalizes a perfect single-cell hit to ~1.
+                        policy_combined = 0.5 * policy_action + 0.5 * min(1.0, policy_coord)
+                    else:
+                        policy_combined = policy_action
+                    blended = 0.7 * blended + 0.3 * policy_combined
+
+        # v4.2 #1: subtract a visit-count penalty for ACTION6 candidates so
+        # the agent stops re-clicking coords it has already burned across
+        # GAME_OVER cycles. Penalty grows from 0 (no visits) toward 0.225
+        # (many visits), so unvisited coords retain their full blended score
+        # while saturated coords get nudged down enough to lose on tie.
+        # 0.15 * v/(1+v): 0 at v=0, 0.075 at v=1, 0.10 at v=2, 0.125 at v=3, …
+        if int(action_id) == 6:
+            point_visits = self._clicked_points.get((int(x), int(y)), 0)
+            bin_visits = self._clicked_bins.get((int(x) // 8, int(y) // 8), 0)
+            point_pen = 0.15 * point_visits / (1.0 + point_visits)
+            bin_pen = 0.075 * bin_visits / (1.0 + bin_visits)
+            blended = blended - (point_pen + bin_pen)
+        return blended
 
     # ---------------------- strategy implementations ----------------------
 
@@ -714,7 +1370,32 @@ class MyAgent(Agent):
         # score, then pick from top-K via weighted random. Falls back to the
         # original sequential cursor when scoring is uniform (early in the
         # episode, before any data is gathered).
-        scored = [(p, self._score_action_candidate(6, p[0], p[1])) for p in self._click_grid_points]
+        # v4.1 (action-effect dict): widen the candidate pool with two extra
+        # sources when the dict is loaded — (a) EDGE_SWEEP_POINTS, (b) up to
+        # 10 coords retrieved from dict entries with the most-similar frame
+        # AND positive level progress (i.e., "what coords cleared a level
+        # from a frame like this in the human replays?"). Then rerank the
+        # whole pool with the blended online + dict score.
+        if self._effect_dict is not None:
+            seen = set(self._click_grid_points)
+            pool = list(self._click_grid_points)
+            for p in EDGE_SWEEP_POINTS:
+                if p not in seen:
+                    seen.add(p)
+                    pool.append(p)
+            qv = self._get_current_query_vec(latest_frame)
+            if qv is not None:
+                try:
+                    demo_coords = self._effect_dict.top_clicks_by_similarity(qv, k=10)
+                except Exception:
+                    demo_coords = []
+                for p in demo_coords:
+                    if p not in seen:
+                        seen.add(p)
+                        pool.append(p)
+        else:
+            pool = self._click_grid_points
+        scored = [(p, self._score_action_candidate(6, p[0], p[1], latest_frame=latest_frame)) for p in pool]
         top_k = sorted(scored, key=lambda kv: -kv[1])[:5]
         if top_k and any(s > 0 for _, s in top_k):
             weights = [s for _, s in top_k]
@@ -760,7 +1441,7 @@ class MyAgent(Agent):
             weighted: List[Tuple[int, float]] = []
             for aid in available:
                 prior_w = float(repeat_kept.get(str(aid), 0.0)) / prior_max
-                online_w = self._score_action_candidate(aid)
+                online_w = self._score_action_candidate(aid, latest_frame=latest_frame)
                 weighted.append((aid, prior_w * 0.5 + online_w * 1.0))
 
             if weighted and any(w > 0 for _, w in weighted):
@@ -944,6 +1625,135 @@ class MyAgent(Agent):
         }
         return action
 
+    def _strategy_dict_top_k_pursuit(self, latest_frame: FrameData) -> GameAction:
+        """v4.2 #4 strategy: deterministic exploit of the dict's top click matches.
+
+        Different from click_grid (weighted-random over top-5): this commits
+        to ONE coord at a time, only rotating after the visit count for that
+        coord exceeds _pursuit_max_visits. For games where one specific click
+        clears the level, this beats sample-from-top-K which spreads attempts.
+
+        Falls back to click_grid when the dict isn't loaded or the query
+        vector can't be computed.
+        """
+        available = _available_action_ids(latest_frame)
+        if 6 not in available:
+            return self._strategy_keyboard_only(latest_frame)
+        if self._effect_dict is None:
+            return self._strategy_click_grid(latest_frame)
+        qv = self._get_current_query_vec(latest_frame)
+        if qv is None:
+            return self._strategy_click_grid(latest_frame)
+
+        # (Re)build pool when empty, fully visited, OR every refresh_interval
+        # actions. The frame-conditioned similarity matters: an early-game
+        # pool stays committed to coords that fit the starting frame even
+        # after the game has visibly changed. Periodic refresh keeps the
+        # recommendations grounded in the current state.
+        self._pursuit_actions_since_refresh += 1
+        needs_refresh = (
+            not self._pursuit_pool
+            or self._pursuit_cursor >= len(self._pursuit_pool)
+            or self._pursuit_actions_since_refresh >= self._pursuit_refresh_interval
+        )
+        if needs_refresh:
+            try:
+                self._pursuit_pool = self._effect_dict.top_clicks_by_similarity(
+                    qv, k=20, prefer_progress=True
+                )
+            except Exception:
+                self._pursuit_pool = []
+            self._pursuit_cursor = 0
+            self._pursuit_actions_since_refresh = 0
+        if not self._pursuit_pool:
+            return self._strategy_click_grid(latest_frame)
+
+        # Advance cursor past coords already burned this run.
+        scanned = 0
+        while scanned < len(self._pursuit_pool):
+            x, y = self._pursuit_pool[self._pursuit_cursor % len(self._pursuit_pool)]
+            visits = self._clicked_points.get((int(x), int(y)), 0)
+            if visits < self._pursuit_max_visits:
+                break
+            self._pursuit_cursor += 1
+            scanned += 1
+        x, y = self._pursuit_pool[self._pursuit_cursor % len(self._pursuit_pool)]
+        # Don't auto-advance the cursor — we want to repeat the same coord
+        # several times unless it saturates. Visit-count gating handles rotation.
+
+        try:
+            action = GameAction.ACTION6
+            action.set_data({'x': int(x), 'y': int(y)})
+        except Exception:
+            return _safe_random_action(self._rng, latest_frame)
+        action.reasoning = {
+            'phase': 'fallback',
+            'strategy': 'dict_top_k_pursuit',
+            'point': [int(x), int(y)],
+            'cursor': self._pursuit_cursor,
+            'pool_size': len(self._pursuit_pool),
+        }
+        return action
+
+    def _strategy_keyboard_dict_sweep(self, latest_frame: FrameData) -> GameAction:
+        """v4.2 #5 strategy: dict-driven action selection for keyboard games.
+
+        Like directional_sustained but the action choice is dict-conditional
+        on the current frame instead of relying on per-game prior's
+        repeat_kept_actions (which doesn't transfer to hidden games). Still
+        repeats the chosen action 3-5 times before reconsidering.
+
+        Falls back to directional_sustained when the dict isn't loaded.
+        """
+        available = [a for a in _available_action_ids(latest_frame) if 1 <= a <= 5]
+        if not available:
+            return _safe_random_action(self._rng, latest_frame)
+        if self._effect_dict is None:
+            return self._strategy_directional_sustained(latest_frame)
+        if self._kbd_dict_remaining > 0 and self._kbd_dict_aid in available:
+            aid = int(self._kbd_dict_aid)
+            self._kbd_dict_remaining -= 1
+        else:
+            qv = self._get_current_query_vec(latest_frame)
+            if qv is None:
+                return self._strategy_directional_sustained(latest_frame)
+            scored: List[Tuple[int, float]] = []
+            for a in available:
+                try:
+                    res = self._effect_dict.lookup(int(a), k=5, precomputed_query=qv)
+                except Exception:
+                    res = {"mean_delta": 0.0, "level_prob": 0.0, "n_matches": 0, "similarity": 0.0}
+                if int(res.get('n_matches', 0)) == 0:
+                    score = 0.0
+                else:
+                    # Heavier weight on level_prob — this is keyboard-game
+                    # specific where most actions visibly change the frame
+                    # but only a few make level progress.
+                    score = (
+                        0.6 * min(1.0, float(res['level_prob']) * 10.0)
+                        + 0.3 * min(1.0, float(res['mean_delta']) / 100.0)
+                        + 0.1 * max(0.0, min(1.0, float(res['similarity'])))
+                    )
+                scored.append((a, score))
+            scored.sort(key=lambda kv: -kv[1])
+            if scored and scored[0][1] > 0.0:
+                aid = int(scored[0][0])
+            else:
+                aid = self._rng.choice(available)
+            self._kbd_dict_aid = aid
+            self._kbd_dict_remaining = self._rng.randint(3, 5) - 1
+        try:
+            action = GameAction.from_id(aid)
+        except Exception:
+            return _safe_random_action(self._rng, latest_frame)
+        action.reasoning = {
+            'phase': 'fallback',
+            'strategy': 'keyboard_dict_sweep',
+            'aid': aid,
+            'remaining': self._kbd_dict_remaining,
+        }
+        return action
+
     def _strategy_action(self, latest_frame: FrameData) -> GameAction:
         strategy = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
         if strategy == 'random_full':
@@ -960,6 +1770,10 @@ class MyAgent(Agent):
             return self._strategy_color_targeted(latest_frame)
         if strategy == 'action_id_sweep':
             return self._strategy_action_id_sweep(latest_frame)
+        if strategy == 'dict_top_k_pursuit':
+            return self._strategy_dict_top_k_pursuit(latest_frame)
+        if strategy == 'keyboard_dict_sweep':
+            return self._strategy_keyboard_dict_sweep(latest_frame)
         return _safe_random_action(self._rng, latest_frame)
 
     def _advance_strategy(self, reason: str = 'game_over') -> None:
@@ -974,7 +1788,17 @@ class MyAgent(Agent):
         """
         self._post_replay_reset_count += 1
         n_strategies = len(self.STRATEGIES)
-        if self._post_replay_reset_count <= n_strategies:
+        # v4.4 random-first bias on hidden games. Kaggle baselines showed
+        # v1 pure random=0.17 > v2/v3 v4-strategy bank=0.08-0.10, so the
+        # structured strategies have been net-negative on hidden. Bias
+        # toward STRATEGIES[0] (random_full) with prob `_random_first_bias`
+        # (env ARC_RANDOM_FIRST_BIAS, default 0.5 on hidden, 0.0 on known).
+        # Falls through to the prior rotation/exploit logic otherwise so
+        # structured strategies still get tried half the time.
+        if self._is_hidden_game and self._rng.random() < self._random_first_bias:
+            self._strategy_idx = 0
+            mode = 'random_bias'
+        elif self._post_replay_reset_count <= n_strategies:
             self._strategy_idx = (self._initial_strategy_idx + self._post_replay_reset_count) % n_strategies
             mode = 'rotation'
         else:
@@ -990,7 +1814,7 @@ class MyAgent(Agent):
             else:
                 self._strategy_idx = self._rng.randrange(n_strategies)
                 mode = 'random'
-        # Reset per-strategy cursors (existing + new v4 state).
+        # Reset per-strategy cursors (existing + new v4/v4.2 state).
         self._click_grid_idx = 0
         self._sustained_dir = None
         self._sustained_remaining = 0
@@ -1001,6 +1825,16 @@ class MyAgent(Agent):
         self._action_id_sweep_idx = 0
         self._action_id_sweep_count = 0
         self._frozen_streak = 0
+        # v4.2: clear pursuit + kbd-dict cursors so new strategy starts fresh.
+        # NOTE: _clicked_points / _clicked_bins / _seen_frame_hashes are NOT
+        # cleared here — visit + novelty memories persist across attempts so
+        # the agent doesn't re-burn the same coords. _on_level_clear() clears
+        # those on real progress.
+        self._pursuit_pool = []
+        self._pursuit_cursor = 0
+        self._pursuit_actions_since_refresh = 0
+        self._kbd_dict_aid = None
+        self._kbd_dict_remaining = 0
         next_strategy = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
         print(
             f'[MyAgent] {self._short_id} reset #{self._post_replay_reset_count} '
@@ -1029,6 +1863,20 @@ class MyAgent(Agent):
             if self._is_hidden_game and not self._transfer_resolved:
                 self._resolve_hidden_game_prior(latest_frame)
 
+            # v4.3 TTT (Stage 1): replay-finetune at action 0 for public games.
+            if not self._ttt_done and self._policy_loaded:
+                self._do_ttt_once(latest_frame)
+            # v4.3 TTT (Stage 2): rollout TTT — capture (s, a, s') pairs into a
+            # buffer, then trigger ttt_rollout_finetune at TTT_ROLLOUT_TRIGGER_STEP.
+            # This is the critical path for HIDDEN games where no replay exists.
+            if self._policy_loaded and not self._rollout_ttt_done:
+                self._capture_rollout_pair(frames, latest_frame)
+                # Trigger condition: enough buffered pairs collected. Don't rely on
+                # action_counter (the framework may not advance it before each
+                # choose_action call). Buffer-size-driven is more robust.
+                if len(self._rollout_buffer_actions) >= self.TTT_ROLLOUT_TRIGGER_STEP:
+                    self._do_rollout_ttt(latest_frame)
+
             # v3: record online action-effect from the previous transition.
             self._record_last_action_effect(frames, latest_frame)
 
@@ -1039,20 +1887,29 @@ class MyAgent(Agent):
                 cur_strat = self.STRATEGIES[self._strategy_idx % len(self.STRATEGIES)]
                 self._strategy_levels[cur_strat] = self._strategy_levels.get(cur_strat, 0) + delta
                 self._last_levels_seen = current_levels
+                # v4.2: real progress — clear coord-visit + frame-novelty
+                # memories so the agent doesn't keep avoiding what just worked.
+                self._on_level_clear()
 
             # v4 improvement #4: freeze detection.
             # Trigger only mid-episode (not during PHASE A replay or initial state),
             # not on GAME_OVER (that path advances strategy via the existing branch),
             # and only if we have replay-exhausted (so we're in Phase B).
-            if (self._frozen_streak >= 8
-                    and self._replay_idx >= len(self._replay)
-                    and latest_frame.state not in (GameState.NOT_PLAYED, GameState.GAME_OVER, GameState.WIN)):
+            # v4.2 #2: also force a switch when novelty rate is low (the agent
+            # is cycling through the same frame states without progress).
+            in_phase_b = (
+                self._replay_idx >= len(self._replay)
+                and latest_frame.state not in (GameState.NOT_PLAYED, GameState.GAME_OVER, GameState.WIN)
+            )
+            novelty_low = self._novelty_rate() < 0.3
+            if in_phase_b and (self._frozen_streak >= 8 or novelty_low):
+                reason = 'freeze' if self._frozen_streak >= 8 else 'low_novelty'
                 print(
-                    f'[MyAgent] {self._short_id} freeze detected '
-                    f'(streak={self._frozen_streak}) → switching strategy',
+                    f'[MyAgent] {self._short_id} {reason} detected '
+                    f'(streak={self._frozen_streak} novelty={self._novelty_rate():.2f}) → switching strategy',
                     flush=True,
                 )
-                self._advance_strategy(reason='freeze')
+                self._advance_strategy(reason=reason)
 
             # Phase A: replay-warm-start (v4 fix: tactical RESET preserved).
             #

@@ -26,8 +26,8 @@ Note the printed `username:` — every `id` field in metadata files MUST start w
 ## Step 1 — Edit metadata files
 
 Replace `USERNAME` with your actual Kaggle handle in **all three** files:
-- `kaggle_notebook/kernel-metadata.json` — `id` and `dataset_sources`
-- `kaggle_notebook/dataset-metadata-replays.json` — `id`
+- `kaggle_notebook/metadata/kernel-metadata.json` — `id` and `dataset_sources`
+- `kaggle_notebook/metadata/dataset-metadata-replays.json` — `id`
 - The staged copy at `Local_Output/kaggle_dataset_replays/dataset-metadata.json` (after step 2 below)
 
 **The slug after `USERNAME/` must equal `slugify(title)`** (see § Hard-won lessons #1 below). Easiest: set both `id` and the title-derived slug to the same string.
@@ -48,10 +48,22 @@ for game in environment_files/*/; do
 done
 
 # Copy dataset metadata
-cp kaggle_notebook/dataset-metadata-replays.json \
+cp kaggle_notebook/metadata/dataset-metadata-replays.json \
    ./Local_Output/kaggle_dataset_replays/dataset-metadata.json
 # (If you edited only the template after this point, copy again or also edit
 #  the staged copy — both must agree.)
+
+# v4.1: also stage the action-effect retrieval dict (loaded by my_agent.py
+# at runtime from /kaggle/input/arc-agi-3-replays-v1/action_effect_dict.npz)
+cp Local_Output/action_effect_dict.npz \
+   ./Local_Output/kaggle_dataset_replays/action_effect_dict.npz
+
+# v4.3: also stage the BC checkpoint (loaded by bc_policy.find_checkpoint at
+# runtime; cell 3 of the notebook copies it to /kaggle/working/best.pth so
+# MyAgent.__init__ can load it for TTT). Use whichever .pth file you want
+# to ship as the base — the most recent local-trained one is recommended.
+cp Training_Output/bc_v2_filtered_local_v1/checkpoints/best.pth \
+   ./Local_Output/kaggle_dataset_replays/best.pth
 
 # Push (--dir-mode zip is MANDATORY for the nested per-game directories)
 kaggle datasets create -p ./Local_Output/kaggle_dataset_replays --dir-mode zip
@@ -65,14 +77,39 @@ kaggle datasets version -p ./Local_Output/kaggle_dataset_replays \
   -m "v2 replays" --dir-mode zip
 ```
 
+**v4.1 dict bundle:** if the dataset is already pushed, add the npz with:
+```bash
+cp Local_Output/action_effect_dict.npz \
+   ./Local_Output/kaggle_dataset_replays/action_effect_dict.npz
+kaggle datasets version -p ./Local_Output/kaggle_dataset_replays \
+  -m "v3 add action_effect_dict.npz" --dir-mode zip
+```
+No kernel-side change is needed — `my_agent.py:_load_action_effect_dict()`
+already searches the canonical Kaggle mount path. Set
+`ARC_DISABLE_EFFECT_DICT=1` in the env for local A/B testing.
+
+**v4.3 BC checkpoint bundle:** to enable TTT (test-time training), add the
+.pth file to the same dataset:
+```bash
+cp Training_Output/bc_v2_filtered_local_v1/checkpoints/best.pth \
+   ./Local_Output/kaggle_dataset_replays/best.pth
+kaggle datasets version -p ./Local_Output/kaggle_dataset_replays \
+  -m "v4 add BC checkpoint best.pth (~190 MB)" --dir-mode zip
+```
+Notebook cell `c-stage` (cell 3) automatically copies the .pth from the
+mounted dataset to `/kaggle/working/best.pth` at submission time.
+`bc_policy.find_checkpoint()` then locates it. Disable TTT via
+`ARC_DISABLE_TTT=1` for clean A/B. The BC checkpoint can be swapped at any
+time without changing notebook code — only the dataset version bumps.
+
 ---
 
 ## Step 3 — Push the notebook
 
 ```bash
 mkdir -p ./Local_Output/kaggle_kernel
-cp kaggle_notebook/kaggle_submission.ipynb ./Local_Output/kaggle_kernel/
-cp kaggle_notebook/kernel-metadata.json     ./Local_Output/kaggle_kernel/
+cp kaggle_notebook/notebooks/kaggle_submission.ipynb ./Local_Output/kaggle_kernel/
+cp kaggle_notebook/metadata/kernel-metadata.json     ./Local_Output/kaggle_kernel/
 
 kaggle kernels push -p ./Local_Output/kaggle_kernel
 ```
@@ -135,7 +172,7 @@ After a code change:
 
 ```bash
 # Re-stage the notebook
-cp kaggle_notebook/kaggle_submission.ipynb ./Local_Output/kaggle_kernel/
+cp kaggle_notebook/notebooks/kaggle_submission.ipynb ./Local_Output/kaggle_kernel/
 
 # Push (creates a new version automatically)
 kaggle kernels push -p ./Local_Output/kaggle_kernel
@@ -181,14 +218,14 @@ Cannot access kernel '<owner>/<bad-slug>' (Permission 'kernels.get' was denied).
 
 The `id` in `dataset-metadata.json` must start with your authenticated Kaggle username (case-sensitive). Common mistakes:
 - Forgot to replace `USERNAME` placeholder
-- Edited the template at `kaggle_notebook/dataset-metadata-replays.json` but not the staged copy at `Local_Output/kaggle_dataset_replays/dataset-metadata.json`. The CLI reads from the staged folder.
+- Edited the template at `kaggle_notebook/metadata/dataset-metadata-replays.json` but not the staged copy at `Local_Output/kaggle_dataset_replays/dataset-metadata.json`. The CLI reads from the staged folder.
 - Different casing between the file and `~/.kaggle/kaggle.json`
 
 **Fix**:
 ```bash
 python -c "import json; print(json.load(open('$HOME/.kaggle/kaggle.json'))['username'])"
 # That's your authoritative username. Make every metadata id start with it.
-grep '"id"' kaggle_notebook/dataset-metadata-replays.json \
+grep '"id"' kaggle_notebook/metadata/dataset-metadata-replays.json \
             Local_Output/kaggle_dataset_replays/dataset-metadata.json
 ```
 
