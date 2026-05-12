@@ -682,7 +682,7 @@ def compute_saliency_mask(
     frame: Sequence[Sequence[int]],
     neighborhood: int = 1,
 ) -> torch.Tensor:
-    """64x64 binary saliency target — same algorithm as kaggle_notebook/my_agent.py:_extract_saliency.
+    """64x64 binary saliency target — same algorithm as kaggle_notebook/agents/my_agent.py:_extract_saliency.
 
     Salient points: rare-color centroids + bbox corners + 4-direction offsets,
     plus 9 default fallback points (center, corners, edge midpoints). Each point

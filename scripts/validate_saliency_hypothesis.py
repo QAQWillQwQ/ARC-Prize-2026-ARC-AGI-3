@@ -57,7 +57,7 @@ def _rare_color_centroids(frame: List[List[int]],
 
 
 def _expanded_saliency_points(frame: List[List[int]]) -> List[Tuple[int, int]]:
-    """Mirrors `kaggle_notebook/my_agent.py::_extract_saliency`: rare-color
+    """Mirrors `kaggle_notebook/agents/my_agent.py::_extract_saliency`: rare-color
     centroid + 4 bbox corners + 4 directional offsets per rare color.
     Returns deduplicated list, capped at 30."""
     color_counts: Dict[int, int] = {}

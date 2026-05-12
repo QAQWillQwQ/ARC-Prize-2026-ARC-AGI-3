@@ -104,9 +104,20 @@ def _convert_one_line(line: str) -> Optional[Dict[str, Any]]:
         "game_id", "short_id", "source", "deviation_pct", "deviation_step",
         "perturb_rate", "seed", "strategy", "score", "levels_completed",
         "actions_taken", "final_state", "resets_used",
+        # Gen 1: optional new fields. Copied through if present in input.
+        "goal_source", "perturb_mode",
     ):
         if key in episode:
             out[key] = episode[key]
+    # Gen 1: goal_frame is List[List[int]] in the JSON; convert to uint8 array
+    # (same compact representation as `frames`). Falls back to all-zeros when
+    # the source episode predates the goal-pairing change.
+    raw_goal = episode.get("goal_frame")
+    if raw_goal is not None:
+        out["goal_frame"] = _frame_to_uint8(raw_goal)
+    else:
+        out["goal_frame"] = np.zeros((64, 64), dtype=np.uint8)
+        out.setdefault("goal_source", "none")
     return out
 
 

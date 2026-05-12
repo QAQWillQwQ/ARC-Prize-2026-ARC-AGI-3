@@ -51,7 +51,7 @@ _agent_spec.loader.exec_module(_agent_mod)
 from arc_agi import Arcade, OperationMode  # noqa: E402
 from arcengine import FrameData, GameAction, GameState  # noqa: E402
 
-sys.path.insert(0, str(ROOT / "kaggle_notebook"))
+sys.path.insert(0, str(ROOT / "kaggle_notebook" / "agents"))
 from my_agent import MyAgent  # noqa: E402
 
 

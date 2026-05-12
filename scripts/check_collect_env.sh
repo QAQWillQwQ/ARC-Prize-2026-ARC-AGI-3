@@ -92,7 +92,7 @@ section "3. Project structure"
 for d in scripts src kaggle_notebook arc_agi_3_wheels environment_files; do
   if [ -d "$d" ]; then ok "$d/"; else fail "$d/ missing"; fi
 done
-for f in scripts/collect_gt_warmstart.py scripts/run_openlab_collect.sh kaggle_notebook/my_agent.py src/agent.py src/common.py; do
+for f in scripts/collect_gt_warmstart.py scripts/run_openlab_collect.sh kaggle_notebook/agents/my_agent.py src/agent.py src/common.py; do
   if [ -f "$f" ]; then ok "$f"; else fail "$f missing"; fi
 done
 

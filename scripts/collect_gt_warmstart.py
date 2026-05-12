@@ -182,7 +182,7 @@ def _get_or_make_env(arc: Arcade, full_id: str) -> Any:
     return env
 
 
-# Phase-B strategies sourced from kaggle_notebook/my_agent.py:
+# Phase-B strategies sourced from kaggle_notebook/agents/my_agent.py:
 ALL_STRATEGIES: Tuple[str, ...] = (
     "random_full",
     "keyboard_only",
@@ -299,6 +299,90 @@ def _step_env(env: Any, action: GameAction) -> Any:
         return None
 
 
+# Gen 1: perturbation mode constants for smarter dataset generation.
+PERTURB_MODE_UNIFORM = "uniform"        # Replace action with a random valid action (existing behavior).
+PERTURB_MODE_COORD = "coord"            # Only perturb ACTION6: shift (x,y) by ±k pixels.
+PERTURB_MODE_DROP = "drop"              # Replace GT action with a "safe" no-op-ish action (ACTION1 if available, else GT).
+ALL_PERTURB_MODES = (PERTURB_MODE_UNIFORM, PERTURB_MODE_COORD, PERTURB_MODE_DROP)
+COORD_OFFSET_K = 4                      # Max pixel shift for coord-mode perturbations.
+
+
+def _apply_perturbation(
+    rng: pyrandom.Random,
+    mode: str,
+    gt_aid: int,
+    gt_x: int,
+    gt_y: int,
+    available_actions: Sequence[int],
+) -> Tuple[int, int, int, bool]:
+    """Apply a perturbation to a GT action. Returns (aid, x, y, did_perturb).
+
+    Modes:
+      uniform: replace action with random valid action (and random coord if ACTION6)
+      coord:   only ACTION6 — keep aid=6, shift (x,y) by ±COORD_OFFSET_K, clamped to [0,63]
+      drop:    replace with ACTION1 if available; else fall through to uniform.
+
+    For coord mode on non-ACTION6 actions, no perturbation is applied (the
+    semantics don't translate). The caller still records this as a 'no-op
+    perturbation' for accounting.
+    """
+    if mode == PERTURB_MODE_COORD:
+        if int(gt_aid) != 6:
+            # Non-click action — coord perturbation is a no-op.
+            return int(gt_aid), int(gt_x), int(gt_y), False
+        # Shift coords within ±k, clamped.
+        dx = rng.randint(-COORD_OFFSET_K, COORD_OFFSET_K)
+        dy = rng.randint(-COORD_OFFSET_K, COORD_OFFSET_K)
+        if dx == 0 and dy == 0:
+            return 6, int(gt_x), int(gt_y), False
+        new_x = max(0, min(63, int(gt_x) + dx))
+        new_y = max(0, min(63, int(gt_y) + dy))
+        return 6, new_x, new_y, True
+    if mode == PERTURB_MODE_DROP:
+        avail = list(available_actions) if available_actions else []
+        if 1 in avail and gt_aid != 1:
+            return 1, 0, 0, True
+        # Fall through to uniform when ACTION1 unavailable / IS the GT action.
+    # Uniform (default fallback for unknown modes too).
+    avail = list(available_actions) if available_actions else []
+    if avail:
+        new_aid = int(rng.choice(avail))
+    else:
+        new_aid = int(gt_aid)
+    new_x = rng.randint(0, 63) if new_aid == 6 else 0
+    new_y = rng.randint(0, 63) if new_aid == 6 else 0
+    return new_aid, new_x, new_y, True
+
+
+def _extract_goal_frame(transitions: Sequence[Dict[str, Any]]) -> Tuple[List[List[int]], str]:
+    """Identify the episode's goal frame for goal-conditioned BC.
+
+    Returns (goal_frame_grid, source_tag) where source_tag is one of:
+      'win'   — the next_frame of the LAST WIN transition (highest-quality goal)
+      'final' — the last transition's next_frame (best we have if no WIN)
+      'none'  — empty/no transitions; returns a 64x64 zero grid
+
+    Goal frames are stored per-episode (not per-transition) — all transitions
+    in the episode share the same goal. At training time, the model conditions
+    its policy on this goal_frame to learn 'how to get from state to goal'
+    instead of just 'what action to take from state'.
+    """
+    if not transitions:
+        return [[0] * 64 for _ in range(64)], "none"
+    # Prefer the last WIN transition's next_frame (most authoritative goal).
+    for t in reversed(transitions):
+        if str(t.get("state_after", "")).upper() == "WIN":
+            nf = t.get("next_frame")
+            if nf is not None:
+                return [list(row) for row in nf], "win"
+            break
+    # Fallback: final transition's next_frame.
+    nf = transitions[-1].get("next_frame")
+    if nf is not None:
+        return [list(row) for row in nf], "final"
+    return [[0] * 64 for _ in range(64)], "none"
+
+
 def _record_transition(
     transitions: List[Dict[str, Any]],
     prev_obs: Any,
@@ -337,6 +421,8 @@ def play_gt_warmstart(
     deviation_step: int,
     max_steps: int,
     perturb_rate: float = 0.0,
+    perturb_mode: str = PERTURB_MODE_UNIFORM,
+    backtrack_on_failure: bool = False,
     rng: Optional[pyrandom.Random] = None,
 ) -> Tuple[Any, int, int, List[Dict[str, Any]]]:
     """Play GT verbatim with v4 tactical-RESET preservation.
@@ -396,19 +482,19 @@ def play_gt_warmstart(
             continue
         # Healthy state, action entry — play (possibly perturbed).
         replay_idx += 1
+        gt_aid = int(entry["id"])
+        gt_x = int(entry.get("x", 0))
+        gt_y = int(entry.get("y", 0))
+        did_perturb = False
         if perturb_rate > 0.0 and rng.random() < perturb_rate:
-            # Replace with random valid action.
             available = list(getattr(raw_obs, "available_actions", []) or [])
-            if available:
-                aid = int(rng.choice(available))
-            else:
-                aid = int(entry["id"])
-            x = rng.randint(0, 63) if aid == 6 else 0
-            y = rng.randint(0, 63) if aid == 6 else 0
+            aid, x, y, did_perturb = _apply_perturbation(
+                rng, perturb_mode, gt_aid, gt_x, gt_y, available,
+            )
         else:
-            aid = int(entry["id"])
-            x = int(entry.get("x", 0))
-            y = int(entry.get("y", 0))
+            aid = gt_aid
+            x = gt_x
+            y = gt_y
         try:
             action = GameAction.from_id(aid)
         except Exception:
@@ -426,6 +512,37 @@ def play_gt_warmstart(
         _record_transition(
             transitions, prev_obs, next_obs, aid, action_data_dict, n_steps, "warmstart",
         )
+        # Tag the just-recorded transition with perturbation metadata.
+        if did_perturb and transitions:
+            transitions[-1]["is_perturbed"] = True
+            transitions[-1]["perturb_mode"] = perturb_mode
+        # Backtrack-on-failure: if the perturbed action killed us, record a
+        # synthetic transition (prev_state, GT_action) so BC sees a positive
+        # example of "this state needed the GT action, not the perturbed one".
+        # next_frame is set to prev_frame as a placeholder — we don't know
+        # what the GT action would have produced.
+        if did_perturb and backtrack_on_failure and transitions:
+            new_state = next_obs.state.name if hasattr(next_obs.state, "name") else str(next_obs.state)
+            old_state = prev_obs.state.name if hasattr(prev_obs.state, "name") else str(prev_obs.state)
+            if new_state == GameState.GAME_OVER.name and old_state != GameState.GAME_OVER.name:
+                prev_grid = [list(row) for row in final_subframe(prev_obs.frame)]
+                backtrack_data = {"x": int(gt_x), "y": int(gt_y)} if gt_aid == 6 else {}
+                transitions.append({
+                    "frame": prev_grid,
+                    "available_actions": list(getattr(prev_obs, "available_actions", []) or []),
+                    "action_id": int(gt_aid),
+                    "action_data": backtrack_data,
+                    "next_frame": prev_grid,  # placeholder; counterfactual is unknown
+                    "levels_before": int(getattr(prev_obs, "levels_completed", 0) or 0),
+                    "levels_after": int(getattr(prev_obs, "levels_completed", 0) or 0),
+                    "state_before": old_state,
+                    "state_after": old_state,
+                    "delta_pixels": 0,
+                    "novelty": 0.0,
+                    "step_index": int(n_steps),
+                    "ttt_phase": "warmstart",
+                    "is_backtrack": True,
+                })
         raw_obs = next_obs
         n_steps += 1
     return raw_obs, n_steps, n_resets, transitions
@@ -465,7 +582,7 @@ def _phase_b_with_myagent(
     import importlib
     if "my_agent" in sys.modules:
         importlib.reload(sys.modules["my_agent"])
-    sys.path.insert(0, str(ROOT / "kaggle_notebook"))
+    sys.path.insert(0, str(ROOT / "kaggle_notebook" / "agents"))
     import my_agent  # noqa: E402
 
     if forced_strategy not in my_agent.MyAgent.STRATEGIES:
@@ -562,6 +679,8 @@ def collect_one(
     strategy: Optional[str],
     project_root: Path,
     recordings_dir: Path,
+    perturb_mode: str = PERTURB_MODE_UNIFORM,
+    backtrack_on_failure: bool = False,
 ) -> Dict[str, Any]:
     """Run one episode and return the payload."""
     seed_everything(seed)
@@ -629,6 +748,8 @@ def collect_one(
             deviation_step=deviation_step,
             max_steps=max_steps,
             perturb_rate=perturb_rate,
+            perturb_mode=perturb_mode,
+            backtrack_on_failure=backtrack_on_failure,
             rng=rng,
         )
         transitions.extend(gt_trans)
@@ -687,6 +808,8 @@ def collect_one(
         raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
     )
     levels = int(getattr(raw_obs, "levels_completed", 0) or 0)
+    # Gen 1: capture per-episode goal_frame for goal-conditioned BC.
+    goal_frame, goal_source = _extract_goal_frame(transitions)
     full_payload: Dict[str, Any] = {
         "game_id": full_id,
         "short_id": short_id,
@@ -694,6 +817,8 @@ def collect_one(
         "deviation_pct": float(deviation_pct),
         "deviation_step": int(deviation_step),
         "perturb_rate": float(perturb_rate),
+        "perturb_mode": str(perturb_mode) if perturb_rate > 0.0 else None,
+        "backtrack_on_failure": bool(backtrack_on_failure) if perturb_rate > 0.0 else None,
         "seed": int(seed),
         "strategy": strategy,
         "score": float(levels),
@@ -701,6 +826,8 @@ def collect_one(
         "actions_taken": len(transitions),
         "final_state": final_state,
         "resets_used": n_resets,
+        "goal_frame": goal_frame,
+        "goal_source": goal_source,
         "transitions": transitions,
     }
     # Path A: worker writes the full episode (with transitions) to its own gz
@@ -728,27 +855,36 @@ def generate_tasks(
     perturb_rates: List[float],
     perturb_seeds: int,
     strategies: List[str],
-) -> List[Tuple[str, str, float, int, float, Optional[str]]]:
-    """Build (full_id, short_id, deviation_pct, seed, perturb_rate, strategy) tasks.
+    perturb_modes: Optional[List[str]] = None,
+) -> List[Tuple[str, str, float, int, float, Optional[str], str]]:
+    """Build (full_id, short_id, deviation_pct, seed, perturb_rate, strategy, perturb_mode) tasks.
 
     Strategy dimension applies ONLY to deviations < 1.0 (where Phase B fires).
     For dev=100% (gt_verbatim) and Bucket 4 (perturbation), strategy is None.
     Dup-seed elision: dev=100% has only 1 task per game (env deterministic).
+
+    Gen 1: perturb_modes spreads perturbation tasks across the available modes
+    (seed % len(modes)) so the corpus contains uniform/coord/drop variants in
+    proportion. Defaults to [PERTURB_MODE_UNIFORM] for back-compat.
     """
-    tasks: List[Tuple[str, str, float, int, float, Optional[str]]] = []
+    if not perturb_modes:
+        perturb_modes = [PERTURB_MODE_UNIFORM]
+    tasks: List[Tuple[str, str, float, int, float, Optional[str], str]] = []
     for full_id, short_id in games:
         for dev in deviations:
             if dev >= 1.0:
                 # gt_verbatim — single deterministic episode per game.
-                tasks.append((full_id, short_id, 1.0, 0, 0.0, None))
+                tasks.append((full_id, short_id, 1.0, 0, 0.0, None, PERTURB_MODE_UNIFORM))
                 continue
             for seed in range(seeds_per_deviation):
                 for strat in strategies:
-                    tasks.append((full_id, short_id, float(dev), seed, 0.0, strat))
+                    tasks.append((full_id, short_id, float(dev), seed, 0.0, strat, PERTURB_MODE_UNIFORM))
         # Bucket 4: perturbation, no strategy needed (Phase B doesn't run).
+        # Spread seeds across perturb_modes so the corpus is mode-balanced.
         for rate in perturb_rates:
             for seed in range(perturb_seeds):
-                tasks.append((full_id, short_id, 1.0, seed + 10000, float(rate), None))
+                mode = perturb_modes[seed % len(perturb_modes)]
+                tasks.append((full_id, short_id, 1.0, seed + 10000, float(rate), None, mode))
     return tasks
 
 
@@ -767,6 +903,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--perturb-rates", type=str, default="0.05,0.10,0.15",
                    help="Comma-separated perturbation rates for Bucket 4. Set to '' to disable.")
     p.add_argument("--perturb-seeds", type=int, default=4)
+    p.add_argument("--perturb-modes", type=str,
+                   default=PERTURB_MODE_UNIFORM,
+                   help=f"Comma-separated perturbation modes from {ALL_PERTURB_MODES}. "
+                        "Each perturbed task picks one mode round-robin by seed. "
+                        f"Default: '{PERTURB_MODE_UNIFORM}' (back-compat).")
+    p.add_argument("--backtrack-on-failure", action="store_true",
+                   help="When a perturbed action causes GAME_OVER, also record a "
+                        "synthetic transition pairing the prev state with the "
+                        "original GT action. Approximately doubles level-clear data.")
     p.add_argument("--strategies", type=str,
                    default="random_full,keyboard_only,click_grid,directional_sustained,edge_sweep,color_targeted,action_id_sweep",
                    help="Comma-separated Phase B strategies (from MyAgent.STRATEGIES). "
@@ -849,6 +994,13 @@ def main() -> int:
         strategies = list(ALL_STRATEGIES)
 
     games_pairs = [(full_ids[s], s) for s in wanted if s in full_ids]
+    perturb_modes_list = [m.strip() for m in (args.perturb_modes or "").split(",") if m.strip()]
+    if not perturb_modes_list:
+        perturb_modes_list = [PERTURB_MODE_UNIFORM]
+    # Validate perturb_modes.
+    for m in perturb_modes_list:
+        if m not in ALL_PERTURB_MODES:
+            raise SystemExit(f"unknown --perturb-modes value '{m}'; valid: {ALL_PERTURB_MODES}")
     tasks = generate_tasks(
         games_pairs,
         deviations,
@@ -856,11 +1008,13 @@ def main() -> int:
         perturb_rates,
         int(args.perturb_seeds),
         strategies,
+        perturb_modes=perturb_modes_list,
     )
     total = len(tasks)
     print(
         f"[collect-gt] games={len(wanted)} dev={deviations} seeds={args.seeds_per_deviation} "
         f"strategies={strategies} perturb_rates={perturb_rates} perturb_seeds={args.perturb_seeds} "
+        f"perturb_modes={perturb_modes_list} backtrack={args.backtrack_on_failure} "
         f"workers={args.workers} max_steps={args.max_steps} total_tasks={total}",
         flush=True,
     )
@@ -872,6 +1026,8 @@ def main() -> int:
         "strategies": strategies,
         "perturb_rates": perturb_rates,
         "perturb_seeds": args.perturb_seeds,
+        "perturb_modes": perturb_modes_list,
+        "backtrack_on_failure": bool(args.backtrack_on_failure),
         "max_steps": args.max_steps,
         "games": wanted,
     })
@@ -929,11 +1085,13 @@ def main() -> int:
                     collect_one,
                     full_id, short_id, dev, seed, args.max_steps, perturb, strat,
                     project_root, recordings_dir,
-                ): (full_id, short_id, dev, seed, perturb, strat)
-                for (full_id, short_id, dev, seed, perturb, strat) in tasks
+                    perturb_mode=pmode,
+                    backtrack_on_failure=bool(args.backtrack_on_failure),
+                ): (full_id, short_id, dev, seed, perturb, strat, pmode)
+                for (full_id, short_id, dev, seed, perturb, strat, pmode) in tasks
             }
             for fut in as_completed(futures):
-                full_id, short_id, dev, seed, perturb, strat = futures[fut]
+                full_id, short_id, dev, seed, perturb, strat, pmode = futures[fut]
                 try:
                     payload = fut.result()
                 except Exception as exc:

@@ -112,9 +112,10 @@ class PolicyGuidedAgent:
         if checkpoint_path:
             self.policy = PolicyBundle(checkpoint_path=checkpoint_path, device=self.device)
             self.history_size = self.policy.history
-            self.max_steps = self.policy.max_steps
-        else:
-            self.max_steps = max_steps
+        # CLI/constructor max_steps ALWAYS wins over checkpoint config — caller
+        # often wants to evaluate with a different budget (e.g. 2000) than the
+        # 192 baked into the saved profile. Same for stall_steps / reset_limit.
+        self.max_steps = max_steps
         self.stall_steps = stall_steps
         self.reset_limit = reset_limit
         self.coord_budget = coord_budget

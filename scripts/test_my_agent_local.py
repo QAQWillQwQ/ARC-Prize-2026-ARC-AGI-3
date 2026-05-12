@@ -1,4 +1,4 @@
-"""Local validation harness for kaggle_notebook/my_agent.py.
+"""Local validation harness for kaggle_notebook/agents/my_agent.py.
 
 Runs the same MyAgent the Kaggle submission uses, but against a LOCAL
 arc_agi.Arcade in OFFLINE mode (no gateway, no Kaggle environment). This
@@ -58,9 +58,23 @@ _agent_spec.loader.exec_module(_agent_mod)
 from arc_agi import Arcade, OperationMode  # noqa: E402
 from arcengine import FrameData, GameAction, GameState  # noqa: E402
 
-sys.path.insert(0, str(ROOT / "kaggle_notebook"))
+sys.path.insert(0, str(ROOT / "kaggle_notebook" / "agents"))
 import my_agent as _my_agent_mod  # noqa: E402
 from my_agent import MyAgent  # noqa: E402
+
+# ARC_AGENT_CLASS selects which agent class to instantiate:
+#   v4       (default) -- kaggle_notebook/agents/my_agent.py:MyAgent
+#   goose             -- kaggle_notebook/agents/goose_agent.py:GooseAgent (T0/T1/T3)
+#   goose_t2          -- kaggle_notebook/agents/goose_agent_t2.py:GooseT2Agent (T2 GRU)
+_AGENT_CLASS = str(os.environ.get("ARC_AGENT_CLASS", "v4")).strip().lower()
+if _AGENT_CLASS == "goose":
+    from goose_agent import GooseAgent  # noqa: E402
+    _AgentCls = GooseAgent
+elif _AGENT_CLASS == "goose_t2":
+    from goose_agent_t2 import GooseT2Agent  # noqa: E402
+    _AgentCls = GooseT2Agent
+else:
+    _AgentCls = MyAgent
 
 # Import per_game_priors path so we can pre-check
 PRIORS_JSON = ROOT / "Local_Output" / "per_game_priors.json"
@@ -85,16 +99,14 @@ class _MockArcEnv:
         return self.env.reset()
 
 
-def _make_agent(game_id: str, env: Any, *, hide_id: bool = False) -> MyAgent:
-    """Construct MyAgent with the framework's required ctor args.
+_META_CACHE: Dict[str, Any] = {}
 
-    `hide_id=True` masks the game_id so the agent cannot find a per-game
-    prior — forces it through the transfer-learning resolution path. Used
-    to simulate hidden games without leaving the local 25-game set.
-    """
+
+def _make_agent(game_id: str, env: Any, *, hide_id: bool = False):
+    """Construct the agent class selected by ARC_AGENT_CLASS env var."""
     arc_env = _MockArcEnv(env)
     visible_id = f"hidden-{abs(hash(game_id)) % 100000}" if hide_id else game_id
-    agent = MyAgent(
+    agent = _AgentCls(
         card_id="local-test",
         game_id=visible_id,
         agent_name="myagent",
@@ -171,6 +183,10 @@ def run_game(arc: Arcade, game_id: str, *, max_steps: int = 192,
     t0 = time.time()
     error: Optional[str] = None
     transitions: List[Dict[str, Any]] = []  # for episodes.jsonl.gz output
+    # Per-level action counts for rhae_score: each entry is the number of
+    # actions taken to clear that level. e.g. [120, 80] = lvl 1 in 120, lvl 2 in 80.
+    completed_level_actions: List[int] = []
+    actions_at_last_level_clear: int = 0
 
     try:
         while actions_taken < max_steps:
@@ -209,6 +225,14 @@ def run_game(arc: Arcade, game_id: str, *, max_steps: int = 192,
             agent.action_counter = actions_taken
             lvl = int(next_frame.levels_completed)
             if lvl > max_levels:
+                # One or more levels just cleared. Credit actions accordingly:
+                # first new level gets the elapsed action count since last clear;
+                # any additional levels in the same step (rare) get 1 each.
+                gap = actions_taken - actions_at_last_level_clear
+                completed_level_actions.append(max(1, gap))
+                for _ in range(lvl - max_levels - 1):
+                    completed_level_actions.append(1)
+                actions_at_last_level_clear = actions_taken
                 max_levels = lvl
             final_state = next_frame.state.name if hasattr(next_frame.state, "name") else str(next_frame.state)
 
@@ -248,6 +272,29 @@ def run_game(arc: Arcade, game_id: str, *, max_steps: int = 192,
             pass
 
     wall = time.time() - t0
+    # rhae_score per game using metadata's baseline_actions when available.
+    short_id = game_id.split("-", 1)[0]
+    score = 0.0
+    max_score = 0.0
+    rhae_payload: Dict[str, Any] = {}
+    try:
+        from src.common import rhae_score, load_metadata_map  # noqa: E402
+        meta = _META_CACHE.get(short_id)
+        if meta is None:
+            try:
+                meta_map = load_metadata_map(ROOT / "environment_files")
+                meta = meta_map.get(short_id) or meta_map.get(game_id, {})
+                _META_CACHE[short_id] = meta
+            except Exception:
+                meta = {}
+        baseline = meta.get("baseline_actions") if meta else None
+        if baseline:
+            rhae_payload = rhae_score(list(baseline), completed_level_actions)
+            score = float(rhae_payload.get("score", 0.0))
+            max_score = float(rhae_payload.get("max_score", 0.0))
+    except Exception as exc:
+        rhae_payload = {"error": str(exc)}
+
     out: Dict[str, Any] = {
         "game_id": game_id,
         "max_levels": max_levels,
@@ -255,6 +302,9 @@ def run_game(arc: Arcade, game_id: str, *, max_steps: int = 192,
         "final_state": final_state,
         "wall_seconds": round(wall, 2),
         "error": error,
+        "completed_level_actions": completed_level_actions,
+        "score": round(score, 3),
+        "max_score": round(max_score, 3),
     }
     if record_transitions:
         out["episode"] = {
@@ -335,7 +385,8 @@ def main() -> int:
             append_jsonl_gz(episodes_gz_path, r["episode"])
         err = r.get("error")
         marker = "ERR" if err else "OK"
-        print(f"[local-test] {marker} {game_id}: levels={r.get('max_levels','?')} actions={r.get('actions_taken','?')} state={r.get('final_state','?')} wall={r.get('wall_seconds',0)}s{f' err={err}' if err else ''}")
+        per_lvl = r.get("completed_level_actions") or []
+        print(f"[local-test] {marker} {game_id}: levels={r.get('max_levels','?')} actions={r.get('actions_taken','?')} score={r.get('score',0):.3f} max_score={r.get('max_score',0):.3f} per_lvl_actions={per_lvl} state={r.get('final_state','?')} wall={r.get('wall_seconds',0)}s{f' err={err}' if err else ''}")
 
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -343,13 +394,14 @@ def main() -> int:
     print()
     print(f"[local-test] wrote {out}")
     print()
-    print(f'{"game":<5} | {"levels":>6} | {"actions":>7} | {"state":>14}')
-    print("-" * 45)
+    print(f'{"game":<5} | {"levels":>6} | {"actions":>7} | {"score":>8} | {"state":>14}')
+    print("-" * 60)
     for r in results:
-        print(f'{r["game_id"]:<5} | {r.get("max_levels", "?"):>6} | {r.get("actions_taken", "?"):>7} | {r.get("final_state", "?"):>14}')
+        print(f'{r["game_id"]:<5} | {r.get("max_levels", "?"):>6} | {r.get("actions_taken", "?"):>7} | {r.get("score", 0):>8.3f} | {r.get("final_state", "?"):>14}')
     levels = [int(r.get("max_levels", 0)) for r in results if r.get("error") is None]
+    scores = [float(r.get("score", 0.0)) for r in results if r.get("error") is None]
     print()
-    print(f"mean levels: {sum(levels)/max(len(levels),1):.2f}  (n={len(levels)})")
+    print(f"mean levels: {sum(levels)/max(len(levels),1):.3f}  mean score: {sum(scores)/max(len(scores),1):.3f}  (n={len(scores)})")
     return 0
 
 

@@ -24,9 +24,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--games", type=str, default=None)
     parser.add_argument("--split", type=str, default=None, choices=["train", "val", None])
-    parser.add_argument("--max-steps", type=int, default=192)
-    parser.add_argument("--stall-steps", type=int, default=24)
-    parser.add_argument("--reset-limit", type=int, default=4)
+    # Defaults match the bc_v2 training condition (max-steps=2000) and give
+    # the agent generous resets so a single bad rollout doesn't terminate the
+    # episode. The 192 / 24 / 4 defaults from the original profile were too
+    # tight — even GT replays need 132-1565 actions to win games.
+    parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument("--stall-steps", type=int, default=200)
+    parser.add_argument("--reset-limit", type=int, default=20)
     return parser.parse_args()
 
 

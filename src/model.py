@@ -18,13 +18,31 @@ class ObjectCentricPolicy(nn.Module):
         depth: int = 6,
         num_heads: int = 8,
         scalar_dim: int = 18,
+        use_goal: bool = False,
     ) -> None:
+        """ObjectCentricPolicy with optional goal-conditioning (Gen 1 BC).
+
+        When `use_goal=True`, accepts an optional `goal_obs` tensor in
+        encode_state/forward. The goal frame is encoded via a small CNN to a
+        `goal_dim` embedding which is added (after projection) to the
+        scalar token. Forces the policy heads to learn (state, goal) →
+        action instead of (state) → action — addresses the cross-game
+        generalization gap measured on bc_v2.
+
+        When `use_goal=False` (default, back-compat), the goal_encoder +
+        goal_proj modules are still constructed (so `state_dict()` is
+        version-stable) but their outputs are zero-gated — old checkpoints
+        load via strict=False with random goal_encoder weights that get
+        ignored. The model behaves exactly like the pre-Gen 1 version.
+        """
         super().__init__()
         input_channels = history * 16
         hidden = max(model_dim // 2, 128)
         self.history = history
         self.model_dim = model_dim
         self.num_slots = num_slots
+        self.use_goal = bool(use_goal)
+        self.goal_dim = 128
 
         self.conv = nn.Sequential(
             nn.Conv2d(input_channels, hidden // 2, kernel_size=3, padding=1),
@@ -59,6 +77,28 @@ class ObjectCentricPolicy(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
         self.state_norm = nn.LayerNorm(model_dim)
+
+        # Gen 1 goal encoder: small CNN over the one-hot goal frame → goal_dim
+        # embedding → projected into model_dim and added to the scalar token.
+        # Always constructed (so state_dict shape is stable); only USED when
+        # self.use_goal is True. Old checkpoints load via strict=False — these
+        # weights stay randomly initialized and are simply not exercised.
+        goal_hidden = 64
+        self.goal_encoder = nn.Sequential(
+            nn.Conv2d(NUM_COLORS, goal_hidden, kernel_size=3, stride=2, padding=1),  # 64→32
+            nn.GELU(),
+            nn.Conv2d(goal_hidden, goal_hidden, kernel_size=3, stride=2, padding=1),  # 32→16
+            nn.GELU(),
+            nn.Conv2d(goal_hidden, self.goal_dim, kernel_size=3, stride=2, padding=1),  # 16→8
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+        self.goal_proj = nn.Sequential(
+            nn.Linear(self.goal_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, model_dim),
+        )
 
         self.action_head = nn.Linear(model_dim, len(ACTION_IDS))
         self.x_head = nn.Linear(model_dim, 64)
@@ -106,7 +146,12 @@ class ObjectCentricPolicy(nn.Module):
             nn.ConvTranspose2d(recon_mid, NUM_COLORS, kernel_size=4, stride=2, padding=1),
         )
 
-    def encode_state(self, obs: torch.Tensor, scalar: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def encode_state(
+        self,
+        obs: torch.Tensor,
+        scalar: torch.Tensor,
+        goal_obs: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
         # Accept either raw color indices or pre-encoded one-hot frames so the
         # model is backward-compatible with PolicyGuidedAgent (which calls
         # `one_hot_frames` on CPU before model forward) AND with the optimized
@@ -135,6 +180,24 @@ class ObjectCentricPolicy(nn.Module):
         slot_tokens, _ = self.cross_attn(query=slots, key=patches, value=patches)
 
         scalar_token = self.scalar_proj(scalar).unsqueeze(1)
+
+        # Gen 1 goal-conditioning. When use_goal=True and a goal_obs is supplied,
+        # encode the goal frame and add its embedding to the scalar token.
+        # Accepts either raw uint8 (B, 64, 64) or one-hot (B, NUM_COLORS, 64, 64).
+        if self.use_goal and goal_obs is not None:
+            if goal_obs.dim() == 3:
+                # Raw indices → one-hot on GPU.
+                gclip = goal_obs.to(dtype=torch.long).clamp_(0, NUM_COLORS - 1)
+                goal_oh = F.one_hot(gclip, num_classes=NUM_COLORS).permute(0, 3, 1, 2).to(dtype=torch.float32)
+            elif goal_obs.dim() == 4 and goal_obs.shape[1] == NUM_COLORS:
+                goal_oh = goal_obs.to(dtype=torch.float32)
+            else:
+                goal_oh = None
+            if goal_oh is not None:
+                goal_emb = self.goal_encoder(goal_oh)        # (B, goal_dim)
+                goal_token = self.goal_proj(goal_emb).unsqueeze(1)  # (B, 1, model_dim)
+                scalar_token = scalar_token + goal_token
+
         tokens = torch.cat([scalar_token, slot_tokens], dim=1)
         tokens = self.encoder(tokens)
         pooled = self.state_norm(tokens[:, 0, :])
@@ -149,8 +212,9 @@ class ObjectCentricPolicy(nn.Module):
         obs: torch.Tensor,
         scalar: torch.Tensor,
         action_index: Optional[torch.Tensor] = None,
+        goal_obs: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        encoded = self.encode_state(obs, scalar)
+        encoded = self.encode_state(obs, scalar, goal_obs=goal_obs)
         pooled = encoded["pooled"]
         patches = encoded["patches"]
         out: Dict[str, torch.Tensor] = {
@@ -190,6 +254,7 @@ def build_model(config: Dict[str, Any], scalar_dim: int = 18) -> ObjectCentricPo
         depth=int(config["depth"]),
         num_heads=int(config["num_heads"]),
         scalar_dim=scalar_dim,
+        use_goal=bool(config.get("use_goal", False)),
     )
 
 

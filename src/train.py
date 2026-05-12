@@ -181,6 +181,24 @@ class EpisodeTransitionDataset(Dataset):
                 frames_tensor = torch.from_numpy(frames_arr).to(dtype=torch.uint8)
             except Exception:
                 frames_tensor = torch.tensor(frame_list, dtype=torch.uint8)
+        # Gen 1: goal_frame for goal-conditioned BC. Cache stores it as
+        # np.uint8 (64, 64); legacy episodes default to all-zeros.
+        goal_frame_raw = episode.get("goal_frame")
+        if goal_frame_raw is None:
+            goal_tensor = torch.zeros((64, 64), dtype=torch.uint8)
+        else:
+            try:
+                import numpy as _np
+                goal_tensor = torch.from_numpy(_np.asarray(goal_frame_raw, dtype=_np.uint8)).to(dtype=torch.uint8)
+                if goal_tensor.shape != (64, 64):
+                    pad = torch.zeros((64, 64), dtype=torch.uint8)
+                    h = min(goal_tensor.shape[0] if goal_tensor.dim() >= 1 else 0, 64)
+                    w = min(goal_tensor.shape[1] if goal_tensor.dim() >= 2 else 0, 64)
+                    if h and w:
+                        pad[:h, :w] = goal_tensor[:h, :w]
+                    goal_tensor = pad
+            except Exception:
+                goal_tensor = torch.zeros((64, 64), dtype=torch.uint8)
         self.episodes.append(
             {
                 "transitions": transitions,
@@ -191,6 +209,7 @@ class EpisodeTransitionDataset(Dataset):
                 "steps_before": steps_before,
                 "weight_mult": weight_mult,
                 "archetype_label": int(archetype_label),
+                "goal_frame": goal_tensor,
             }
         )
         self.sample_index.extend((episode_index, idx) for idx in range(len(transitions)))
@@ -225,14 +244,20 @@ class EpisodeTransitionDataset(Dataset):
         else:
             saliency_target = self._zero_saliency
 
+        # Goal frame for goal-conditioned BC. Same goal for all transitions
+        # in episode; per-sample loaded from episode dict.
+        goal_frame = episode["goal_frame"]
+
         # Color-permutation augmentation. Apply the SAME perm to obs, next_obs,
-        # and next_frame_target so the BC objective is consistent under the
-        # permutation. Probability gate happens once per sample.
+        # next_frame_target, AND goal_frame so the BC objective is consistent
+        # under the permutation (the perm shouldn't change the (state, goal)
+        # mapping). Probability gate happens once per sample.
         if self.color_permutation_prob > 0.0 and random.random() < self.color_permutation_prob:
             perm_table = self._sample_color_perm()
             history_frames = self._apply_color_perm(history_frames, perm_table)
             next_history_frames = self._apply_color_perm(next_history_frames, perm_table)
             next_frame = self._apply_color_perm(next_frame, perm_table)
+            goal_frame = self._apply_color_perm(goal_frame, perm_table)
 
         # Next-frame recon target = the frame after the current action, as long color indices.
         # Skipped when aux_recon_weight=0.
@@ -279,6 +304,7 @@ class EpisodeTransitionDataset(Dataset):
             ),
             "saliency_target": saliency_target,
             "next_frame_target": next_frame_target,
+            "goal_obs": goal_frame.to(dtype=torch.uint8),
             "weight": torch.tensor(
                 float(episode["weight_mult"])
                 * (
@@ -362,6 +388,13 @@ def parse_args() -> argparse.Namespace:
                         help="Per-sample probability of randomly permuting colors 1..15 "
                              "(background fixed). Forces the model to learn color-invariant "
                              "features. 0 disables. Default: 0.5 — proxy for hidden-game palette shift.")
+    parser.add_argument("--use-goal", action="store_true",
+                        help="Gen 1: enable goal-conditioned BC. Adds a goal_encoder + "
+                             "goal_proj that consume each episode's goal_frame (eventual WIN "
+                             "frame) and add the embedding to the scalar token. Requires the "
+                             "training cache to have goal_frame fields (built by the Gen 1 "
+                             "collector + build_train_cache; legacy caches default to zeros, "
+                             "which makes goal-conditioning a no-op).")
     return parser.parse_args()
 
 
@@ -809,14 +842,19 @@ def run_epoch(
     for step, batch in enumerate(loader):
         batch_size = int(batch["obs"].shape[0])
         batch = move_batch(batch, device)
+        # Gen 1: pass goal_obs through both forward passes when present.
+        goal_obs = batch.get("goal_obs")
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=autocast_enabled):
             out = model(
                 obs=batch["obs"],
                 scalar=batch["scalar"],
                 action_index=batch["action_index"],
+                goal_obs=goal_obs,
             )
             with torch.no_grad():
-                next_latent = model.encode_state(batch["next_obs"], batch["next_scalar"])["pooled"]
+                next_latent = model.encode_state(
+                    batch["next_obs"], batch["next_scalar"], goal_obs=goal_obs,
+                )["pooled"]
 
             action_loss_per = F.cross_entropy(
                 out["action_logits"],
@@ -1011,6 +1049,7 @@ def main() -> None:
         "aux_saliency_weight": args.aux_saliency_weight,
         "aux_recon_weight": args.aux_recon_weight,
         "color_permutation_prob": args.color_permutation_prob,
+        "use_goal": bool(args.use_goal),
     }
     config = merge_config(args.hardware_profile, overrides)
     config["hardware_profile"] = args.hardware_profile
@@ -1022,6 +1061,7 @@ def main() -> None:
     config.setdefault("aux_saliency_weight", 0.10)
     config.setdefault("aux_recon_weight", 0.10)
     config.setdefault("color_permutation_prob", 0.5)
+    config.setdefault("use_goal", False)
     data_paths = parse_data_paths(args.data)
     requested_games = parse_game_filter(args.games)
     config["data"] = [str(path) for path in data_paths]
