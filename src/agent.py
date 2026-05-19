@@ -26,6 +26,7 @@ from .common import (
     visual_saliency_summary,
 )
 from .model import build_model, load_checkpoint
+from .source_planner import PlannedAction, SourceSearchPlanner
 
 OPPOSITE_ACTION_IDS: Dict[int, int] = {1: 2, 2: 1, 3: 4, 4: 3}
 MOVE_ACTION_VECTORS: Dict[int, Tuple[int, int]] = {
@@ -98,6 +99,7 @@ class PolicyGuidedAgent:
         coord_budget: int = 20,
         random_seed: Optional[int] = None,
         game_prior: Optional[Dict[str, Any]] = None,
+        source_planner: Optional[SourceSearchPlanner] = None,
     ) -> None:
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -131,6 +133,11 @@ class PolicyGuidedAgent:
         self.tried_points: Dict[Tuple[int, int], int] = {}
         self.rng = random.Random(random_seed)
         self.game_prior = dict(game_prior or {})
+        self.source_planner = source_planner
+        self.source_plan_queue: Deque[CandidateAction] = deque()
+        self.source_plan_level: Optional[int] = None
+        self.source_attempted_levels: set[Tuple[str, int]] = set()
+        self.source_previous_solutions: Dict[int, List[PlannedAction]] = {}
         raw_action_scores = dict(self.game_prior.get("action_scores") or {})
         self.action_prior_scores: Dict[int, float] = {
             int(action_id): float(score)
@@ -144,6 +151,12 @@ class PolicyGuidedAgent:
                 continue
             self.coord_hint_points.append((int(point[0]), int(point[1])))
         self.coord_hint_set = set(self.coord_hint_points)
+
+    def reset_source_plans(self) -> None:
+        self.source_plan_queue.clear()
+        self.source_plan_level = None
+        self.source_attempted_levels = set()
+        self.source_previous_solutions = {}
 
     def reset_memory(self, initial_frame: Sequence[Sequence[int]]) -> None:
         self.history_frames.clear()
@@ -612,6 +625,57 @@ class PolicyGuidedAgent:
                 return True
         return False
 
+    def _source_plan_candidate(self, game_id: str, levels_completed: int) -> Optional[CandidateAction]:
+        if self.source_planner is None:
+            return None
+
+        level_idx = int(levels_completed)
+        if self.source_plan_level != level_idx:
+            self.source_plan_queue.clear()
+            self.source_plan_level = level_idx
+
+        if self.source_plan_queue:
+            return self.source_plan_queue.popleft()
+
+        key = (game_id.split("-", 1)[0], level_idx)
+        if key in self.source_attempted_levels:
+            return None
+        self.source_attempted_levels.add(key)
+
+        previous_solution = self.source_previous_solutions.get(level_idx - 1)
+        result = self.source_planner.plan(
+            game_id=game_id,
+            level_idx=level_idx,
+            previous_solution=previous_solution,
+        )
+        if not result.solved or not result.actions:
+            return None
+
+        self.source_previous_solutions[level_idx] = list(result.actions)
+        queue: Deque[CandidateAction] = deque()
+        for index, planned in enumerate(result.actions):
+            metadata = {
+                "planner_method": result.method,
+                "planner_message": result.message,
+                "planner_level": int(result.level_idx),
+                "planner_step": int(index),
+                "planner_explored": int(result.explored),
+                "planner_unique_states": int(result.unique_states),
+                "planner_elapsed_seconds": round(float(result.elapsed_seconds), 6),
+                "planned_reason": planned.reason,
+            }
+            queue.append(
+                CandidateAction(
+                    action_id=int(planned.action_id),
+                    action_data=dict(planned.action_data or {}),
+                    score=float(planned.score),
+                    source="source_planner",
+                    metadata=metadata,
+                )
+            )
+        self.source_plan_queue = queue
+        return self.source_plan_queue.popleft() if self.source_plan_queue else None
+
     def play_env(
         self,
         env: Any,
@@ -623,6 +687,7 @@ class PolicyGuidedAgent:
             raise RuntimeError("Environment returned no observation at start of play_env")
         frame = final_subframe(raw_obs.frame)
         self.reset_memory(frame)
+        self.reset_source_plans()
         resets_used = 0
         transitions: List[Dict[str, Any]] = []
 
@@ -639,16 +704,23 @@ class PolicyGuidedAgent:
                     break
                 frame = final_subframe(raw_obs.frame)
                 self.reset_memory(frame)
+                self.source_plan_queue.clear()
+                self.source_plan_level = None
                 continue
 
             prev_frame = self.history_frames[-2] if len(self.history_frames) > 1 else None
-            action = self.choose_action(
-                frame=self.history_frames[-1],
-                prev_frame=prev_frame,
-                available_actions=getattr(raw_obs, "available_actions", []),
+            action = self._source_plan_candidate(
+                game_id=game_id,
                 levels_completed=int(raw_obs.levels_completed),
-                step_index=step_index,
             )
+            if action is None:
+                action = self.choose_action(
+                    frame=self.history_frames[-1],
+                    prev_frame=prev_frame,
+                    available_actions=getattr(raw_obs, "available_actions", []),
+                    levels_completed=int(raw_obs.levels_completed),
+                    step_index=step_index,
+                )
             game_action = GameAction.from_id(action.action_id)
             next_obs = env.step(game_action, data=action.action_data or {})
             if next_obs is None:
@@ -713,6 +785,8 @@ class PolicyGuidedAgent:
                     break
                 frame = final_subframe(raw_obs.frame)
                 self.reset_memory(frame)
+                self.source_plan_queue.clear()
+                self.source_plan_level = None
 
         final_state = raw_obs.state.name if hasattr(raw_obs.state, "name") else str(raw_obs.state)
         return {

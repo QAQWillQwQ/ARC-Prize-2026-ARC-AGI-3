@@ -15,18 +15,25 @@ from .common import (
     save_json,
     split_games,
 )
+from .source_planner import SourceSearchPlanner
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate a checkpoint on public ARC-AGI-3 games.")
     parser.add_argument("--project-root", type=str, default=".")
-    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--output", type=str, required=True)
     parser.add_argument("--games", type=str, default=None)
     parser.add_argument("--split", type=str, default=None, choices=["train", "val", None])
     parser.add_argument("--max-steps", type=int, default=192)
     parser.add_argument("--stall-steps", type=int, default=24)
     parser.add_argument("--reset-limit", type=int, default=4)
+    parser.add_argument("--source-planner", action="store_true")
+    parser.add_argument("--planner-timeout", type=float, default=45.0)
+    parser.add_argument("--planner-max-states", type=int, default=120000)
+    parser.add_argument("--planner-depth", type=int, default=36)
+    parser.add_argument("--planner-candidate-budget", type=int, default=24)
+    parser.add_argument("--planner-branch-factor", type=int, default=18)
     return parser.parse_args()
 
 
@@ -58,11 +65,23 @@ def main() -> None:
         recordings_dir=str(output_path.parent / "eval_recordings"),
     )
 
+    source_planner = None
+    if args.source_planner:
+        source_planner = SourceSearchPlanner(
+            environments_dir=project_root / "environment_files",
+            search_timeout=float(args.planner_timeout),
+            max_states=int(args.planner_max_states),
+            max_depth=int(args.planner_depth),
+            candidate_budget=int(args.planner_candidate_budget),
+            branch_factor=int(args.planner_branch_factor),
+        )
+
     agent = PolicyGuidedAgent(
         checkpoint_path=args.checkpoint,
         max_steps=args.max_steps,
         stall_steps=args.stall_steps,
         reset_limit=args.reset_limit,
+        source_planner=source_planner,
     )
 
     per_game: List[Dict[str, Any]] = []
@@ -100,6 +119,14 @@ def main() -> None:
 
     summary = {
         "checkpoint": args.checkpoint,
+        "source_planner": {
+            "enabled": bool(args.source_planner),
+            "timeout": float(args.planner_timeout),
+            "max_states": int(args.planner_max_states),
+            "depth": int(args.planner_depth),
+            "candidate_budget": int(args.planner_candidate_budget),
+            "branch_factor": int(args.planner_branch_factor),
+        },
         "num_games": len(per_game),
         "mean_score": safe_mean([item["score"] for item in per_game]),
         "mean_levels_completed": safe_mean([float(item["levels_completed"]) for item in per_game]),
