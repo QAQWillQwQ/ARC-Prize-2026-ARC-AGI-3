@@ -92,11 +92,12 @@ def build_example(
         )
         if chosen and selected_index < 0:
             selected_index = index
+        action_source = str(transition.get("action_source", ""))
         source_verified = bool(
             chosen
             and (
-                str(transition.get("action_source", "")).startswith("source")
-                or str(transition.get("action_source", "")) == "source_planner"
+                action_source.startswith("source")
+                or action_source in {"source_planner", "forge_bfs_replay"}
                 or int(transition.get("delta_pixels", 0)) > 0
                 or int(transition.get("levels_after", 0)) > int(transition.get("levels_before", 0))
             )

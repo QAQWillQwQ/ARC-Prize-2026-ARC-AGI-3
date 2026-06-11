@@ -250,6 +250,10 @@ def source_phase_label(transition: Dict[str, Any]) -> str:
     metadata = dict(transition.get("action_metadata") or {})
     if source == "source_planner":
         return str(metadata.get("planner_method", "source_planner"))
+    if source == "forge_bfs_replay":
+        return "source_bfs_replay"
+    if source == "forge_cnn_fallback":
+        return "cnn_fallback"
     if source in {"policy", "policy+coord"}:
         return "checkpoint_policy"
     if source in {"coord", "heuristic"}:
